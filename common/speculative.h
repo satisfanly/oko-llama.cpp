@@ -89,6 +89,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// Exact generation-checkpoint support. This is deliberately narrower than
+// get_state()/set_state(): only speculative implementations whose complete
+// cross-round state has been audited may opt in here.
+bool common_speculative_checkpoint_supported(const common_speculative * spec, std::string & why);
+bool common_speculative_checkpoint_set_state(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const std::vector<uint8_t> & data,
+        std::string & why);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

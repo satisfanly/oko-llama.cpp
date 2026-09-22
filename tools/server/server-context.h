@@ -132,6 +132,8 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t post_checkpoint_resume;
+    server_http_context::handler_t post_checkpoint_restore;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
@@ -164,10 +166,17 @@ private:
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type);
+            task_response_type res_type,
+            std::shared_ptr<server_generation_checkpoint> checkpoint_restore = nullptr);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_suspend(
+            const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_checkpoint_resume(
+            const server_http_req & req);
+    std::unique_ptr<server_res_generator> handle_checkpoint_restore(
+            const server_http_req & req);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
 

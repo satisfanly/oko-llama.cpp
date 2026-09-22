@@ -76,6 +76,21 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     // Build grammar if tools are present
     bool has_tools =
         autoparser.tools.format.mode != tool_format::NONE && inputs.tools.is_array() && !inputs.tools.empty();
+
+    // Expose the actual per-call delimiters to the sampling layer. Prefer
+    // per-call markers; section markers are only safe as a fallback for
+    // templates where one section corresponds to one tool call.
+    if (has_tools) {
+        const auto & format = autoparser.tools.format;
+        if (!format.per_call_start.empty() && !format.per_call_end.empty()) {
+            data.tool_call_start_tag = format.per_call_start;
+            data.tool_call_end_tag   = format.per_call_end;
+        } else if (!format.section_start.empty() && !format.section_end.empty()) {
+            data.tool_call_start_tag = format.section_start;
+            data.tool_call_end_tag   = format.section_end;
+        }
+    }
+
     std::string trigger_marker = !autoparser.tools.format.section_start.empty() ? autoparser.tools.format.section_start :
                                                                                   autoparser.tools.format.per_call_start;
 

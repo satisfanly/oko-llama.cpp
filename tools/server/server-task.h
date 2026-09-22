@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -25,8 +26,29 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_SUSPEND,
+    SERVER_TASK_TYPE_SLOT_SUSPEND_CANCEL,
+    SERVER_TASK_TYPE_SLOT_CHECKPOINT_RESTORE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+};
+
+struct server_checkpoint_exchange;
+struct server_generation_checkpoint;
+
+// parser/output state owned by the HTTP response reader (task_result_state),
+// preserved so the resumed stream continues without duplicate or missing deltas
+struct server_checkpoint_parser_state {
+    std::string generated_text;
+    std::vector<std::string> generated_tool_call_ids;
+    std::vector<size_t> sent_tool_call_names;
+    bool thinking_block_started = false;
+    bool text_block_started = false;
+    bool oai_resp_created = false;
+    std::string oai_resp_id;
+    std::string oai_resp_reasoning_id;
+    std::string oai_resp_message_id;
+    std::string oai_resp_fc_id;
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -125,6 +147,17 @@ struct task_result_state {
 
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
+    // restore the OpenAI Responses IDs from a checkpoint instead of generating new ones
+    task_result_state(
+            const common_chat_parser_params & chat_parser_params,
+            const std::string & oai_resp_id,
+            const std::string & oai_resp_reasoning_id,
+            const std::string & oai_resp_message_id);
+
+    // export/import the parser/output state for generation checkpointing
+    server_checkpoint_parser_state checkpoint_export() const;
+    void checkpoint_import(const server_checkpoint_parser_state & state);
+
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
         const std::string & text_added,
@@ -142,6 +175,20 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+
+    // normalized request used to build this task, needed to reconstruct the
+    // exact local schema/sampler/task initialization path after process restart
+    json checkpoint_request_json;
+
+    // set only for a resume-created task
+    std::shared_ptr<server_generation_checkpoint> checkpoint_restore;
+
+    // set only for a resume-created task, the parser/output state to restore
+    server_checkpoint_parser_state checkpoint_parser_state;
+    bool checkpoint_has_parser_state = false;
+
+    // used by SERVER_TASK_TYPE_SLOT_SUSPEND
+    std::shared_ptr<server_checkpoint_exchange> checkpoint_suspend_exchange;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -247,7 +294,17 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+        if (!checkpoint_has_parser_state) {
+            return task_result_state(params.chat_parser_params);
+        }
+
+        task_result_state state(
+                params.chat_parser_params,
+                checkpoint_parser_state.oai_resp_id,
+                checkpoint_parser_state.oai_resp_reasoning_id,
+                checkpoint_parser_state.oai_resp_message_id);
+        state.checkpoint_import(checkpoint_parser_state);
+        return state;
     }
 
     bool is_parent() const {
@@ -531,6 +588,23 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+// checkpoint barrier result, sent on the original task result stream so the
+// response reader processes every earlier result first, then exports its
+// parser state into the shared exchange
+struct server_task_result_checkpoint_barrier : server_task_result {
+    std::shared_ptr<server_checkpoint_exchange> exchange;
+    int suspended_slot = -1;
+    int suspended_task = -1;
+
+    virtual bool is_stop() override {
+        return false;
+    }
+
+    virtual void update(task_result_state & state) override;
 
     virtual json to_json() override;
 };

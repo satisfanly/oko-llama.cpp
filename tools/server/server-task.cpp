@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "server-chat.h"
+#include "server-checkpoint.h"
 #include "chat.h"
 #include "common.h"
 #include "json-schema-to-grammar.h"
@@ -60,6 +61,10 @@ json task_params::to_json(bool only_metrics) const {
             {"dry_base",                  sampling.dry_base},
             {"dry_allowed_length",        sampling.dry_allowed_length},
             {"dry_penalty_last_n",        sampling.dry_penalty_last_n},
+            {"dry_generated_only",        sampling.dry_generated_only},
+            {"dry_exclude_sysp",          sampling.dry_exclude_sysp},
+            {"dry_think_only",            sampling.dry_think_only},
+            {"thinking_eos_modifier",     sampling.thinking_eos_modifier},
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
@@ -112,6 +117,10 @@ json task_params::to_json(bool only_metrics) const {
         {"dry_base",                  sampling.dry_base},
         {"dry_allowed_length",        sampling.dry_allowed_length},
         {"dry_penalty_last_n",        sampling.dry_penalty_last_n},
+        {"dry_generated_only",        sampling.dry_generated_only},
+        {"dry_exclude_sysp",          sampling.dry_exclude_sysp},
+        {"dry_think_only",            sampling.dry_think_only},
+        {"thinking_eos_modifier",     sampling.thinking_eos_modifier},
         {"dry_sequence_breakers",     sampling.dry_sequence_breakers},
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
@@ -156,6 +165,59 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
         // initialize chat_msg to avoid emitting a delta containing the assistant prefill
         chat_msg = common_chat_parse("", true, chat_parser_params);
+    }
+}
+
+task_result_state::task_result_state(
+        const common_chat_parser_params & chat_parser_params,
+        const std::string & oai_resp_id,
+        const std::string & oai_resp_reasoning_id,
+        const std::string & oai_resp_message_id)
+    : chat_parser_params(chat_parser_params)
+    , oai_resp_id(oai_resp_id)
+    , oai_resp_reasoning_id(oai_resp_reasoning_id)
+    , oai_resp_message_id(oai_resp_message_id) {
+    if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
+        // Match the ordinary constructor: initialize chat_msg so continuation
+        // prefill is not emitted as a fresh delta after resume.
+        chat_msg = common_chat_parse("", true, chat_parser_params);
+    }
+}
+
+server_checkpoint_parser_state task_result_state::checkpoint_export() const {
+    server_checkpoint_parser_state state;
+    state.generated_text          = generated_text;
+    state.generated_tool_call_ids = generated_tool_call_ids;
+    state.sent_tool_call_names.assign(sent_tool_call_names.begin(), sent_tool_call_names.end());
+    state.thinking_block_started  = thinking_block_started;
+    state.text_block_started      = text_block_started;
+    state.oai_resp_created        = oai_resp_created;
+    state.oai_resp_id             = oai_resp_id;
+    state.oai_resp_reasoning_id   = oai_resp_reasoning_id;
+    state.oai_resp_message_id     = oai_resp_message_id;
+    state.oai_resp_fc_id          = oai_resp_fc_id;
+    return state;
+}
+
+void task_result_state::checkpoint_import(const server_checkpoint_parser_state & state) {
+    generated_text          = state.generated_text;
+    generated_tool_call_ids = state.generated_tool_call_ids;
+    sent_tool_call_names.clear();
+    for (size_t i : state.sent_tool_call_names) {
+        sent_tool_call_names.insert(i);
+    }
+    thinking_block_started  = state.thinking_block_started;
+    text_block_started      = state.text_block_started;
+    oai_resp_created        = state.oai_resp_created;
+    oai_resp_fc_id          = state.oai_resp_fc_id;
+
+    // reparse the accumulated generated text with the same parser params to
+    // rebuild chat_msg, safer than serializing parser internals
+    if (!generated_text.empty()) {
+        chat_msg = common_chat_parse(generated_text, true, chat_parser_params);
+        if (!chat_msg.empty()) {
+            chat_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        }
     }
 }
 
@@ -234,6 +296,34 @@ common_chat_msg task_result_state::update_chat_msg(
         }
     }
     return chat_msg;
+}
+
+//
+// server_task_result_checkpoint_barrier
+//
+void server_task_result_checkpoint_barrier::update(task_result_state & state) {
+    if (!exchange) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(exchange->mutex);
+    if (exchange->cancelled) {
+        exchange->cv.notify_all();
+        return;
+    }
+    exchange->parser = state.checkpoint_export();
+    exchange->parser_ready = true;
+    exchange->ready = true;
+    exchange->cv.notify_all();
+}
+
+json server_task_result_checkpoint_barrier::to_json() {
+    // private backend/proxy event, the outer Ollama proxy must consume it
+    return {
+        {"__llama_checkpoint", "suspended"},
+        {"id_slot", suspended_slot},
+        {"id_task", suspended_task},
+    };
 }
 
 //

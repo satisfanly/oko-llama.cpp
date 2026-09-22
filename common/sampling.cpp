@@ -6,6 +6,10 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "../src/llama-grammar.h" // exact tool-call trigger matching for thinking EOS protection
+#include "../src/llama-vocab.h"   // use the exact token->piece path used by lazy grammar
+
+#include "../src/llama-sampler.h" // internal sampler checkpoint helpers
 
 #include <algorithm>
 #include <cctype>
@@ -108,12 +112,165 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// Independent detector for tool-call grammar triggers.
+//
+// The normal lazy grammar is intentionally not fed generated tokens while the
+// reasoning-budget sampler is active. That means it cannot be used to decide
+// whether a tool call has started *inside* a reasoning block. Mirror the exact
+// trigger definitions here and feed this detector every generated accepted
+// token instead. We only care about the trigger edge; after it fires, the EOS
+// modifier stays disabled for the remainder of this generated turn.
+struct common_tool_call_detector {
+    const llama_vocab * vocab = nullptr;
+
+    bool is_tool_call_grammar = false;
+    bool detection_available = true;
+    bool active_from_start = false;
+    bool detected = false;
+
+    std::vector<llama_token> trigger_tokens;
+
+    // WORD triggers are literal strings. A match can only start within the last
+    // (len - 1) bytes, so keep a bounded suffix instead of the full trace.
+    std::vector<llama_grammar_trigger_pattern> word_patterns;
+    size_t word_buffer_max = 0;
+    std::string word_buffer;
+
+    // PATTERN / PATTERN_FULL triggers are arbitrary regexes that may match
+    // anywhere or be anchored to the full prefix, so they need the full text.
+    std::vector<llama_grammar_trigger_pattern> pattern_patterns;
+    std::string pattern_buffer;
+
+    void reset() {
+        detected = active_from_start;
+        word_buffer.clear();
+        pattern_buffer.clear();
+    }
+
+    bool accept(llama_token token) {
+        if (!is_tool_call_grammar || !detection_available || detected || !vocab) {
+            return false;
+        }
+
+        if (std::find(trigger_tokens.begin(), trigger_tokens.end(), token) != trigger_tokens.end()) {
+            detected = true;
+            word_buffer.clear();
+            pattern_buffer.clear();
+            return true;
+        }
+
+        // Use the exact rendered-token semantics used by llama's lazy grammar.
+        const std::string piece = vocab->token_to_piece(token);
+
+        if (!word_patterns.empty()) {
+            word_buffer += piece;
+
+            for (const auto & trigger_pattern : word_patterns) {
+                if (trigger_pattern.find(word_buffer) != std::string::npos) {
+                    detected = true;
+                    word_buffer.clear();
+                    pattern_buffer.clear();
+                    return true;
+                }
+            }
+
+            // keep only enough trailing bytes for the longest word trigger
+            const size_t keep = word_buffer_max > 0 ? word_buffer_max - 1 : 0;
+            if (word_buffer.size() > keep) {
+                word_buffer.erase(0, word_buffer.size() - keep);
+            }
+        }
+
+        if (!pattern_patterns.empty()) {
+            pattern_buffer += piece;
+
+            for (const auto & trigger_pattern : pattern_patterns) {
+                if (trigger_pattern.find(pattern_buffer) != std::string::npos) {
+                    detected = true;
+                    word_buffer.clear();
+                    pattern_buffer.clear();
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+};
+
+static common_tool_call_detector common_tool_call_detector_init(
+        const llama_vocab * vocab,
+        const common_params_sampling & params) {
+    common_tool_call_detector out;
+    out.vocab = vocab;
+    out.is_tool_call_grammar = params.grammar.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
+
+    if (!out.is_tool_call_grammar) {
+        return out;
+    }
+
+    for (const auto & trigger : params.grammar_triggers) {
+        if (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
+            out.trigger_tokens.push_back(trigger.token);
+            continue;
+        }
+
+        std::string pattern;
+        switch (trigger.type) {
+            case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                pattern = regex_escape(trigger.value);
+                out.word_buffer_max = std::max(out.word_buffer_max, trigger.value.size());
+                break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+                pattern = trigger.value;
+                break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+                pattern = "^$";
+                if (!trigger.value.empty()) {
+                    pattern = (trigger.value.front() != '^' ? "^" : "")
+                        + trigger.value
+                        + (trigger.value.back() != '$' ? "$" : "");
+                }
+                break;
+            default:
+                GGML_ASSERT(false && "unknown grammar trigger type");
+        }
+
+        auto & compiled = (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD
+            ? out.word_patterns
+            : out.pattern_patterns).emplace_back();
+        compiled.pattern = std::move(pattern);
+        compiled.regex = std::regex(compiled.pattern);
+    }
+
+    out.detection_available = !out.trigger_tokens.empty() ||
+                              !out.word_patterns.empty() ||
+                              !out.pattern_patterns.empty();
+
+    // Fail safe only when there is genuinely no way to observe the tool-call
+    // transition. This applies equally to lazy and eager/non-lazy tool-call
+    // grammars: when trigger metadata exists, keep detecting the actual trigger
+    // so reasoning before the tool call can still receive EOS protection.
+    if (!out.detection_available) {
+        out.active_from_start = true;
+        out.detected = true;
+    }
+
+    return out;
+}
+
 struct common_sampler {
     common_params_sampling params;
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
+    struct llama_sampler * tbudget;
     struct llama_sampler * chain;
+
+    bool thinking_eos_post_pending = false;
+    bool tool_budget_forced = false;
+    common_tool_call_detector tool_call_detector;
+    bool thinking_eos_modifier_log_active = false;
 
     ring_buffer<llama_token> prev;
 
@@ -121,10 +278,30 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // exact-build generation checkpoint support
+    std::vector<common_sampler_accept_event> checkpoint_accept_history;
+    bool checkpoint_replaying = false;
+
     void reset() {
+        if (!checkpoint_replaying &&
+            thinking_eos_modifier_log_active) {
+            LOG_WRN(
+                "%s: thinking EOS modifier DISABLED (reason=sampler reset)\n",
+                __func__);
+        }
+
+        thinking_eos_post_pending = false;
+        tool_budget_forced = false;
+        tool_call_detector.reset();
+        thinking_eos_modifier_log_active = false;
+
         prev.clear();
 
         llama_sampler_reset(chain);
+
+        if (!checkpoint_replaying) {
+            checkpoint_accept_history.clear();
+        }
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -173,11 +350,19 @@ std::string common_params_sampling::print() const {
 
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
-            "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
+            "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d, dry_generated_only = %s, dry_exclude_sysp = %s, dry_think_only = %s\n"
+            "\tthinking_eos_modifier = %.3g\n"
             "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
             "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, adaptive_target = %.3f, adaptive_decay = %.3f",
             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
-            dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            dry_penalty_last_n,
+            dry_generated_only ? "true" : "false",
+            dry_exclude_sysp   ? "true" : "false",
+            dry_think_only     ? "true" : "false",
+            thinking_eos_modifier,
             top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
@@ -205,6 +390,7 @@ struct common_sampler * common_sampler_init(
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * tbudget = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -308,7 +494,14 @@ struct common_sampler * common_sampler_init(
     }
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+    if (!params.reasoning_budget_start.empty() &&
+        !params.reasoning_budget_end.empty() &&
+        (params.grammar_lazy ||
+         params.reasoning_budget_tokens >= 0 ||
+         params.reasoning_control ||
+         params.dry_think_only ||
+         params.thinking_eos_modifier > 1.0f)) {
+
         rbudget = common_reasoning_budget_init(
             vocab,
             {params.reasoning_budget_start},
@@ -319,6 +512,22 @@ struct common_sampler * common_sampler_init(
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+        }
+    }
+
+    // Tool-call budget sampler. The existing reasoning-budget sampler is a
+    // generic start/end sequence state machine, so reuse it with independent
+    // state. It automatically re-arms when another tool-call start tag appears.
+    if (!params.tool_budget_start.empty() && !params.tool_budget_end.empty() && params.tool_budget_tokens >= 0) {
+        tbudget = common_reasoning_budget_init(
+            nullptr, // hard token limit: do not extend budget to complete UTF-8
+            {params.tool_budget_start},
+            params.tool_budget_end,
+            params.tool_budget_forced,
+            params.tool_budget_tokens);
+        for (const auto & token : prefill_tokens) {
+            llama_sampler_accept(tbudget, token);
+            LOG_DBG("%s: tool-budget accepted prefill token (%d)\n", __func__, token);
         }
     }
 
@@ -424,15 +633,37 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    if (tbudget && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with tool-call budget, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params                  = */ params,
+        /* .grmr                    = */ grmr,
+        /* .rbudget                 = */ rbudget,
+        /* .tbudget                 = */ tbudget,
+        /* .chain                   = */ chain,
+        /* .thinking_eos_post_pending = */ false,
+        /* .tool_budget_forced      = */ false,
+        /* .tool_call_detector      = */ common_tool_call_detector_init(vocab, params),
+        /* .thinking_eos_modifier_log_active = */ false,
+        /* .prev                    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur                     = */ {},
+        /* .cur_p                   = */ {},
+        /* .checkpoint_accept_history = */ {},
+        /* .checkpoint_replaying      = */ false,
     };
+
+    if (params.thinking_eos_modifier > 1.0f &&
+        result->tool_call_detector.is_tool_call_grammar &&
+        !result->tool_call_detector.detection_available) {
+        LOG_WRN(
+            "%s: thinking EOS modifier disabled for this request: "
+            "tool-call grammar has no trigger metadata\n",
+            __func__);
+    }
 
     return result;
 }
@@ -444,6 +675,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
 
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
+    llama_sampler_free(gsmpl->tbudget);
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
@@ -451,6 +683,16 @@ void common_sampler_free(struct common_sampler * gsmpl) {
 
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
+        return false;
+    }
+    // A hard tool-call cutoff can deliberately inject TOOL_EOS at a point the
+    // JSON/tool grammar would reject (for example in the middle of a runaway
+    // string argument). Once that happens the grammar automaton can no longer
+    // be kept consistent, so leave it disabled for the rest of this response.
+    if (gsmpl->tool_budget_forced) {
+        return false;
+    }
+    if (gsmpl->tbudget && common_reasoning_budget_get_state(gsmpl->tbudget) == REASONING_BUDGET_FORCING) {
         return false;
     }
     if (!gsmpl->rbudget) {
@@ -464,15 +706,183 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
-void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+static bool common_reasoning_state_is_thinking(
+        common_reasoning_budget_state state) {
+    switch (state) {
+        case REASONING_BUDGET_COUNTING:
+        case REASONING_BUDGET_WAITING_UTF8:
+        case REASONING_BUDGET_FORCING:
+            return true;
+
+        case REASONING_BUDGET_IDLE:
+        case REASONING_BUDGET_DONE:
+            return false;
+    }
+
+    return false;
+}
+
+static bool common_sampler_thinking_eos_modifier_active(
+        const struct common_sampler * gsmpl) {
+    if (!gsmpl->rbudget ||
+        gsmpl->params.thinking_eos_modifier <= 1.0f) {
+        return false;
+    }
+
+    // Tool-call detection is authoritative for this feature and intentionally
+    // independent from reasoning-budget state. A template may produce a valid
+    // tool call while rbudget still says COUNTING/THINKING.
+    if (gsmpl->tool_call_detector.is_tool_call_grammar) {
+        // Fail safe: if a tool-call grammar exists but exposes no trigger
+        // metadata, do not risk suppressing the tool-call EOG.
+        if (!gsmpl->tool_call_detector.detection_available ||
+            gsmpl->tool_call_detector.detected) {
+            return false;
+        }
+    }
+
+    const auto state =
+        common_reasoning_budget_get_state(gsmpl->rbudget);
+
+    return common_reasoning_state_is_thinking(state) ||
+           gsmpl->thinking_eos_post_pending;
+}
+
+static const char * common_sampler_thinking_eos_modifier_phase(
+        const struct common_sampler * gsmpl) {
+    if (gsmpl->tool_call_detector.detected) {
+        return "tool-call trigger matched";
+    }
+    if (gsmpl->tool_call_detector.is_tool_call_grammar &&
+        !gsmpl->tool_call_detector.detection_available) {
+        return "tool-call detection unavailable";
+    }
+    if (gsmpl->thinking_eos_post_pending) {
+        return "first post-reasoning token";
+    }
+    return "reasoning";
+}
+
+static void common_sampler_sync_thinking_eos_modifier_log(
+        struct common_sampler * gsmpl,
+        bool active,
+        const char * reason = nullptr) {
+    if (gsmpl->checkpoint_replaying) {
+        // Restore the bookkeeping state, but don't emit historical warnings.
+        gsmpl->thinking_eos_modifier_log_active = active;
+        return;
+    }
+
+    if (active == gsmpl->thinking_eos_modifier_log_active) {
+        return;
+    }
+
+    gsmpl->thinking_eos_modifier_log_active = active;
+
+    if (active) {
+        LOG_WRN(
+            "%s: thinking EOS modifier ENABLED (N=%.3g, phase=%s)\n",
+            __func__,
+            (double) gsmpl->params.thinking_eos_modifier,
+            common_sampler_thinking_eos_modifier_phase(gsmpl));
+    } else {
+        LOG_WRN(
+            "%s: thinking EOS modifier DISABLED (reason=%s)\n",
+            __func__,
+            reason ? reason : common_sampler_thinking_eos_modifier_phase(gsmpl));
+    }
+}
+
+static void common_sampler_apply_thinking_eos_modifier(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        llama_token_data_array * cur_p) {
+    const bool active = common_sampler_thinking_eos_modifier_active(gsmpl);
+    common_sampler_sync_thinking_eos_modifier_log(gsmpl, active);
+
+    if (!active) {
+        return;
+    }
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const float divisor = gsmpl->params.thinking_eos_modifier;
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        // Protect every effective end-of-generation token, not only the
+        // vocabulary's canonical EOS token. Some chat models terminate with
+        // EOT/im_end/etc. instead of llama_vocab_eos().
+        if (!llama_vocab_is_eog(vocab, cur_p->data[i].id)) {
+            continue;
+        }
+
+        if (std::isinf(divisor)) {
+            cur_p->data[i].logit = -INFINITY;
+        } else if (cur_p->data[i].logit != -INFINITY) {
+            //
+            // Dividing softmax weight by N is equivalent to:
+            //
+            //     exp(logit) / N
+            //   = exp(logit - log(N))
+            //
+            cur_p->data[i].logit -= std::log(divisor);
+        }
+
+        // Logit ordering may have changed.
+        cur_p->sorted = false;
+    }
+}
+
+static void common_sampler_reset_dry(
+        struct common_sampler * gsmpl) {
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+
+    for (int i = 0; i < n; ++i) {
+        struct llama_sampler * smpl =
+            llama_sampler_chain_get(gsmpl->chain, i);
+
+        if (std::strcmp(llama_sampler_name(smpl), "dry") == 0) {
+            llama_sampler_reset(smpl);
+        }
+    }
+}
+
+void common_sampler_accept(
+        struct common_sampler * gsmpl,
+        llama_token token,
+        bool is_generated,
+        bool exclude_from_dry) {
     if (!gsmpl) {
         return;
     }
 
+    // record the accept event at the outermost entry, before any local routing
+    // mutates state, so replay can reproduce the exact local behavior
+    if (!gsmpl->checkpoint_replaying) {
+        const uint32_t local_flags = exclude_from_dry ? COMMON_ACCEPT_F_EXCLUDE_FROM_DRY : COMMON_ACCEPT_F_NONE;
+        gsmpl->checkpoint_accept_history.push_back({token, is_generated, local_flags});
+    }
+
     const auto tm = gsmpl->tm();
 
-    // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
+    const auto reasoning_state_before =
+        gsmpl->rbudget
+            ? common_reasoning_budget_get_state(gsmpl->rbudget)
+            : REASONING_BUDGET_IDLE;
+
+    // grammar_should_apply() checks budget state, so calculate this before we accept
     const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
+
+    if (gsmpl->tbudget && is_generated) {
+        // Remember if this token was injected by the tool budget. The grammar
+        // is intentionally not advanced through a potentially invalid hard
+        // cutoff; see grammar_should_apply().
+        if (common_reasoning_budget_get_state(gsmpl->tbudget) == REASONING_BUDGET_FORCING) {
+            gsmpl->tool_budget_forced = true;
+        }
+        llama_sampler_accept(gsmpl->tbudget, token);
+    }
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
@@ -493,7 +903,128 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
         llama_sampler_accept(gsmpl->grmr, token);
     }
 
-    llama_sampler_accept(gsmpl->chain, token);
+    const auto reasoning_state_after =
+        gsmpl->rbudget
+            ? common_reasoning_budget_get_state(gsmpl->rbudget)
+            : REASONING_BUDGET_IDLE;
+
+    const bool was_thinking =
+        common_reasoning_state_is_thinking(reasoning_state_before);
+
+    const bool is_thinking =
+        common_reasoning_state_is_thinking(reasoning_state_after);
+
+    //
+    // Starting a new thinking block must always start with a fresh
+    // DRY history. This also handles models which emit more than one
+    // thinking block in a single response.
+    //
+    if (gsmpl->params.dry_think_only &&
+        is_generated &&
+        !was_thinking &&
+        is_thinking) {
+        common_sampler_reset_dry(gsmpl);
+    }
+
+    bool skip_dry;
+
+    if (gsmpl->params.dry_think_only) {
+        //
+        // DRY is active only for generated tokens belonging to the
+        // current reasoning block.
+        //
+        // Checking both states is intentional:
+        //
+        //   IDLE     -> COUNTING : include thinking-start transition
+        //   COUNTING -> DONE     : include thinking-end transition
+        //
+        skip_dry =
+            !is_generated ||
+            !(was_thinking || is_thinking);
+    } else {
+        //
+        // Existing behaviour from dry-generated-only /
+        // dry-exclude-sysp patches.
+        //
+        skip_dry =
+            exclude_from_dry ||
+            (!is_generated && gsmpl->params.dry_generated_only);
+    }
+
+    if (skip_dry) {
+        // Feed the token to every sampler except DRY.
+        // This preserves history/state for penalties and other stateful
+        // samplers while selectively keeping this token out of DRY history.
+        const int n = llama_sampler_chain_n(gsmpl->chain);
+
+        for (int i = 0; i < n; ++i) {
+            struct llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+
+            if (std::strcmp(llama_sampler_name(smpl), "dry") != 0) {
+                llama_sampler_accept(smpl, token);
+            }
+        }
+    } else {
+        llama_sampler_accept(gsmpl->chain, token);
+    }
+
+    //
+    // The thinking block just ended.
+    //
+    // Clearing DRY here is important: otherwise the accumulated thinking
+    // history would still affect sampling of the final answer even though
+    // final-answer tokens themselves are excluded from DRY history.
+    //
+    if (gsmpl->params.dry_think_only &&
+        is_generated &&
+        was_thinking &&
+        !is_thinking) {
+        common_sampler_reset_dry(gsmpl);
+    }
+
+    // Detect a real tool-call start independently of rbudget. The normal lazy
+    // grammar deliberately does not consume tokens while reasoning is active,
+    // so using its current state here would reproduce the bug this fixes.
+    const bool tool_call_started_now =
+        is_generated && gsmpl->tool_call_detector.accept(token);
+
+    if (is_generated &&
+        gsmpl->params.thinking_eos_modifier > 1.0f) {
+
+        const bool ended_thinking_now =
+            was_thinking &&
+            reasoning_state_after == REASONING_BUDGET_DONE;
+
+        const char * off_reason = nullptr;
+
+        if (tool_call_started_now) {
+            // A tool-call trigger is stronger evidence than rbudget. It may
+            // happen while rbudget still reports active reasoning. Disable EOS
+            // suppression for the tool body/termination immediately.
+            gsmpl->thinking_eos_post_pending = false;
+            off_reason = "tool-call trigger matched";
+        } else if (ended_thinking_now) {
+            //
+            // A normal reasoning end has just completed.
+            //
+            // Keep suppression enabled for exactly the next sampled token.
+            //
+            gsmpl->thinking_eos_post_pending = true;
+        } else if (gsmpl->thinking_eos_post_pending) {
+            //
+            // The first post-thinking token has now actually been accepted.
+            // Do not clear this during sample()/grammar retries.
+            //
+            gsmpl->thinking_eos_post_pending = false;
+            off_reason = "first post-reasoning token accepted";
+        }
+
+        // Emit an edge-triggered warning as soon as accept-side state changes.
+        common_sampler_sync_thinking_eos_modifier_log(
+            gsmpl,
+            common_sampler_thinking_eos_modifier_active(gsmpl),
+            off_reason);
+    }
 
     gsmpl->prev.push_back(token);
 }
@@ -507,15 +1038,23 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+    auto * out = new common_sampler {
+        /* .params                  = */ gsmpl->params,
+        /* .grmr                    = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget                 = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .tbudget                 = */ llama_sampler_clone(gsmpl->tbudget),
+        /* .chain                   = */ llama_sampler_clone(gsmpl->chain),
+        /* .thinking_eos_post_pending = */ gsmpl->thinking_eos_post_pending,
+        /* .tool_budget_forced      = */ gsmpl->tool_budget_forced,
+        /* .tool_call_detector      = */ gsmpl->tool_call_detector,
+        /* .thinking_eos_modifier_log_active = */ gsmpl->thinking_eos_modifier_log_active,
+        /* .prev                    = */ gsmpl->prev,
+        /* .cur                     = */ gsmpl->cur,
+        /* .cur_p                   = */ gsmpl->cur_p,
+        /* .checkpoint_accept_history = */ gsmpl->checkpoint_accept_history,
+        /* .checkpoint_replaying      = */ false,
     };
+    return out;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -525,17 +1064,128 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+    GGML_ASSERT((src->tbudget == nullptr) == (dst->tbudget == nullptr));
 
     llama_sampler_copy(src->grmr,    dst->grmr);
     llama_sampler_copy(src->rbudget, dst->rbudget);
+    llama_sampler_copy(src->tbudget, dst->tbudget);
     llama_sampler_copy(src->chain,   dst->chain);
 
-    dst->params     = src->params;
-    dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->t_total_us = src->t_total_us;
+    dst->params                  = src->params;
+    dst->thinking_eos_post_pending = src->thinking_eos_post_pending;
+    dst->tool_budget_forced      = src->tool_budget_forced;
+    dst->tool_call_detector      = src->tool_call_detector;
+    dst->thinking_eos_modifier_log_active = src->thinking_eos_modifier_log_active;
+    dst->prev                    = src->prev;
+    dst->cur                     = src->cur;
+    dst->cur_p                   = src->cur_p;
+    dst->cur_p.data              = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->t_total_us              = src->t_total_us;
+    dst->checkpoint_accept_history = src->checkpoint_accept_history;
+    dst->checkpoint_replaying    = false;
+}
+
+//
+// exact-build generation checkpoint support
+//
+
+const std::vector<common_sampler_accept_event> &
+common_sampler_checkpoint_accept_history(const common_sampler * gsmpl) {
+    GGML_ASSERT(gsmpl != nullptr);
+    return gsmpl->checkpoint_accept_history;
+}
+
+bool common_sampler_checkpoint_replay_accept_history(
+        common_sampler * gsmpl,
+        const std::vector<common_sampler_accept_event> & events,
+        std::string & error) {
+    if (!gsmpl) {
+        error = "null common_sampler";
+        return false;
+    }
+
+    struct checkpoint_replay_guard {
+        common_sampler * sampler;
+        ~checkpoint_replay_guard() {
+            sampler->checkpoint_replaying = false;
+        }
+    } guard { gsmpl };
+
+    // reset through the local reset path, then replay every saved event
+    // through the existing local accept implementation so that the local
+    // DRY/reasoning transition logic runs again
+    gsmpl->checkpoint_replaying = true;
+
+    try {
+        common_sampler_reset(gsmpl);
+
+        // common_sampler_reset() resets the ordinary sampler chain, but grmr
+        // and rbudget are maintained separately. Checkpoint replay must start
+        // all accept-side state from a clean state even if this helper is ever
+        // called on a sampler that is not freshly constructed.
+        if (gsmpl->grmr)    llama_sampler_reset(gsmpl->grmr);
+        if (gsmpl->rbudget) llama_sampler_reset(gsmpl->rbudget);
+
+        for (const auto & ev : events) {
+            const bool exclude_from_dry = (ev.local_flags & COMMON_ACCEPT_F_EXCLUDE_FROM_DRY) != 0;
+            common_sampler_accept(gsmpl, ev.token, ev.is_generated, exclude_from_dry);
+        }
+    } catch (const std::exception & e) {
+        error = std::string("failed to replay sampler accept history: ") + e.what();
+        return false;
+    } catch (...) {
+        error = "failed to replay sampler accept history: unknown exception";
+        return false;
+    }
+
+    gsmpl->checkpoint_accept_history = events;
+    return true;
+}
+
+bool common_sampler_checkpoint_supported(const common_sampler * gsmpl, std::string & error) {
+    if (!gsmpl) {
+        error = "null sampler";
+        return false;
+    }
+    if (gsmpl->params.backend_sampling) {
+        error = "backend sampling";
+        return false;
+    }
+    if (gsmpl->params.mirostat != 0) {
+        error = "mirostat";
+        return false;
+    }
+    if (gsmpl->params.adaptive_target >= 0.0f) {
+        error = "adaptive-p";
+        return false;
+    }
+    if (gsmpl->params.xtc_probability > 0.0f) {
+        error = "xtc";
+        return false;
+    }
+
+    return llama_sampler_checkpoint_supported(gsmpl->chain, error);
+}
+
+bool common_sampler_checkpoint_export_apply_state(
+        const common_sampler * gsmpl,
+        std::vector<uint8_t> & out,
+        std::string & error) {
+    if (!common_sampler_checkpoint_supported(gsmpl, error)) {
+        return false;
+    }
+    return llama_sampler_checkpoint_export_apply_state(gsmpl->chain, out, error);
+}
+
+bool common_sampler_checkpoint_import_apply_state(
+        common_sampler * gsmpl,
+        const uint8_t * data,
+        size_t size,
+        std::string & error) {
+    if (!common_sampler_checkpoint_supported(gsmpl, error)) {
+        return false;
+    }
+    return llama_sampler_checkpoint_import_apply_state(gsmpl->chain, data, size, error);
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -601,6 +1251,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
+    auto & tbudget = gsmpl->tbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
@@ -616,6 +1267,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT(!gsmpl->tbudget && "using tool-call budget in combination with backend sampling is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -628,8 +1280,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // apply reasoning budget first
-    llama_sampler_apply(rbudget, &cur_p);
+    // Tool-call hard cutoff has priority if both budget samplers somehow enter
+    // FORCING at the same time. Otherwise the two samplers are independent.
+    const bool tool_forcing = tbudget &&
+        common_reasoning_budget_get_state(tbudget) == REASONING_BUDGET_FORCING;
+    if (!tool_forcing) {
+        llama_sampler_apply(rbudget, &cur_p);
+    }
+    llama_sampler_apply(tbudget, &cur_p);
+
+    common_sampler_apply_thinking_eos_modifier(gsmpl, ctx, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
@@ -660,7 +1320,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
 
-    llama_sampler_apply(rbudget,  &cur_p);
+    const bool tool_forcing_retry = tbudget &&
+        common_reasoning_budget_get_state(tbudget) == REASONING_BUDGET_FORCING;
+    if (!tool_forcing_retry) {
+        llama_sampler_apply(rbudget, &cur_p);
+    }
+    llama_sampler_apply(tbudget, &cur_p);
+
+    common_sampler_apply_thinking_eos_modifier(gsmpl, ctx, &cur_p);
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);

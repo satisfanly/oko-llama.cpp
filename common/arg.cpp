@@ -2160,6 +2160,51 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling());
     add_opt(common_arg(
+        {"--dry-generated-only"},
+        "use only generated tokens as DRY history; prompt tokens are ignored",
+        [](common_params & params) {
+            params.sampling.dry_generated_only = true;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-exclude-sysp"},
+        "exclude system prompt/message tokens from DRY history; "
+        "user and assistant prompt tokens are still included",
+        [](common_params & params) {
+            params.sampling.dry_exclude_sysp = true;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-think-only"},
+        "apply DRY only during the current generated reasoning/thinking block; "
+        "prompt and final-answer tokens are excluded",
+        [](common_params & params) {
+            params.sampling.dry_think_only = true;
+        }
+    ).set_sampling());
+
+    add_opt(common_arg(
+        {"--thinking-eos-modifier"}, "N",
+        string_format(
+            "divide EOS sampling weight by N while reasoning is active and "
+            "while sampling the first token immediately after reasoning ends; "
+            "tool-call grammar triggers disable the modifier immediately even "
+            "if the reasoning-budget sampler still reports active reasoning "
+            "(default: %.2f, 1 = disabled). "
+            "Use a large value such as 1e6 for very strong suppression; "
+            "use 'inf' to make EOS impossible during the protected window",
+            (double) params.sampling.thinking_eos_modifier),
+        [](common_params & params, const std::string & value) {
+            const float modifier = std::stof(value);
+            if (std::isnan(modifier) || modifier < 1.0f) {
+                throw std::runtime_error(
+                    "error: thinking-eos-modifier must be >= 1\n");
+            }
+            params.sampling.thinking_eos_modifier = modifier;
+        }
+    ).set_sampling());
+
+    add_opt(common_arg(
         {"--dry-sequence-breaker"}, "STRING",
         string_format("add sequence breaker for DRY sampling, clearing out default breakers (%s) in the process; use \"none\" to not use any sequence breakers\n",
             params.sampling.dry_sequence_breakers.empty() ? "none" :
@@ -3742,6 +3787,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.reasoning_budget_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
+    add_opt(common_arg(
+        {"--max-tools-tokens"}, "N",
+        "maximum generated tokens inside each tool call before forcing the template's tool-call end token/sequence; -1 disables (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.tool_budget_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MAX_TOOLS_TOKENS"));
+    add_opt(common_arg(
+        {"--max-tools-tokens-message"}, "MESSAGE",
+        "message injected after a forced tool-call end, prefixed by the template reasoning-start tag (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.tool_budget_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MAX_TOOLS_TOKENS_MESSAGE"));
     add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",

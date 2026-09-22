@@ -3711,6 +3711,47 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
+        // Specialized parsers bypass peg_generator::generate_parser(), but the
+        // differential analyzer can still usually identify the tool-call
+        // delimiters. Use it only for delimiter discovery here; parser/grammar
+        // generation remains on the specialized path.
+        if (params.tools.is_array() && !params.tools.empty()) {
+            try {
+                struct autoparser::autoparser marker_parser;
+                marker_parser.analyze_template(tmpl);
+                const auto & format = marker_parser.tools.format;
+                if (!format.per_call_start.empty() && !format.per_call_end.empty()) {
+                    result->tool_call_start_tag = format.per_call_start;
+                    result->tool_call_end_tag   = format.per_call_end;
+                } else if (!format.section_start.empty() && !format.section_end.empty()) {
+                    result->tool_call_start_tag = format.section_start;
+                    result->tool_call_end_tag   = format.section_end;
+                }
+            } catch (const std::exception & e) {
+                LOG_DBG("%s: could not discover tool-call budget delimiters for specialized template: %s\n",
+                        __func__, e.what());
+            }
+
+            // Some specialized parsers intentionally bypass the differential
+            // autoparser. Cover the common explicit per-call wrappers directly
+            // from template source; do not guess formats without a distinct
+            // per-call start/end pair.
+            if (result->tool_call_start_tag.empty()) {
+                const std::pair<const char *, const char *> known_markers[] = {
+                    {"<|tool_call_begin|>", "<|tool_call_end|>"},
+                    {"<|tool_call_start|>", "<|tool_call_end|>"},
+                    {"<tool_call>",         "</tool_call>"},
+                };
+                for (const auto & markers : known_markers) {
+                    if (src.find(markers.first) != std::string::npos &&
+                        src.find(markers.second) != std::string::npos) {
+                        result->tool_call_start_tag = markers.first;
+                        result->tool_call_end_tag   = markers.second;
+                        break;
+                    }
+                }
+            }
+        }
         return *result;
     }
 

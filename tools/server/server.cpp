@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-checkpoint.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -232,6 +233,31 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
+        // A checkpoint is an opaque binary blob tied to one concrete loaded
+        // model instance and one backend slot. The generic router proxy chooses
+        // a child from JSON request metadata, so it cannot safely route this
+        // endpoint. External schedulers must address the owning model instance.
+        routes.post_checkpoint_resume = [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            const json error = format_error_response(
+                    "checkpoint resume is not supported in router mode; "
+                    "send the checkpoint to the owning model instance",
+                    ERROR_TYPE_NOT_SUPPORTED);
+            res->status = json_value(error, "code", 501);
+            res->data = safe_json_to_str({{"error", error}});
+            return res;
+        };
+        routes.post_checkpoint_restore = [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            const json error = format_error_response(
+                    "checkpoint restore is not supported in router mode; "
+                    "send the checkpoint to the owning model instance",
+                    ERROR_TYPE_NOT_SUPPORTED);
+            res->status = json_value(error, "code", 501);
+            res->data = safe_json_to_str({{"error", error}});
+            return res;
+        };
+
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
@@ -284,6 +310,26 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    if (is_router_server) {
+        // Keep router checkpoint endpoints on the ordinary request-body limit.
+        // They only return a clear not-supported response and must not accept a
+        // multi-GiB opaque body that the router cannot route.
+        ctx_http.post(
+                "/v1/checkpoint/resume",
+                ex_wrapper(routes.post_checkpoint_resume));
+        ctx_http.post(
+                "/v1/checkpoint/restore",
+                ex_wrapper(routes.post_checkpoint_restore));
+    } else {
+        ctx_http.post(
+                "/v1/checkpoint/resume",
+                ex_wrapper(routes.post_checkpoint_resume),
+                server_checkpoint_max_size());
+        ctx_http.post(
+                "/v1/checkpoint/restore",
+                ex_wrapper(routes.post_checkpoint_restore),
+                server_checkpoint_max_size());
+    }
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h
