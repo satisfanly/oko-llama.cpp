@@ -19,6 +19,7 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    size_t payload_max_length = CPPHTTPLIB_PAYLOAD_MAX_LENGTH;
 };
 
 server_http_context::server_http_context()
@@ -297,6 +298,23 @@ bool server_http_context::init(const common_params & params) {
             res.set_content("", "text/html"); // blank response, no data
             return httplib::Server::HandlerResponse::Handled; // skip further processing
         }
+
+        // Checkpoint resume raises cpp-httplib's server-wide payload ceiling so
+        // that one explicitly-large POST route can be read through a
+        // ContentReader. GET/HEAD routes still use regular httplib handlers and
+        // therefore would otherwise inherit that enlarged ceiling. llama-server
+        // has no GET/HEAD endpoint that consumes a request body, so reject such
+        // requests before httplib buffers the body.
+        const bool has_request_body =
+            (req.has_header("Content-Length") &&
+             req.get_header_value_u64("Content-Length") > 0) ||
+            req.has_header("Transfer-Encoding");
+        if ((req.method == "GET" || req.method == "HEAD") && has_request_body) {
+            res.status = httplib::StatusCode::BadRequest_400;
+            res.set_content("GET/HEAD request bodies are not supported", "text/plain");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+
         if (!middleware_server_state(req, res)) {
             return httplib::Server::HandlerResponse::Handled;
         }
@@ -542,6 +560,176 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
+static bool server_http_media_type_is(
+        const std::string & value,
+        const std::string & expected) {
+    size_t begin = 0;
+    while (begin < value.size() &&
+           (value[begin] == ' ' || value[begin] == '\t')) {
+        ++begin;
+    }
+
+    size_t end = value.find(';', begin);
+    if (end == std::string::npos) {
+        end = value.size();
+    }
+    while (end > begin &&
+           (value[end - 1] == ' ' || value[end - 1] == '\t')) {
+        --end;
+    }
+
+    if (end - begin != expected.size()) {
+        return false;
+    }
+
+    auto ascii_lower = [](unsigned char c) -> unsigned char {
+        return c >= 'A' && c <= 'Z' ? (unsigned char) (c - 'A' + 'a') : c;
+    };
+
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (ascii_lower((unsigned char) value[begin + i]) !=
+            ascii_lower((unsigned char) expected[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static server_http_req_ptr make_server_http_request(
+        const httplib::Request & req,
+        std::string body,
+        std::map<std::string, uploaded_file> files) {
+    auto params = get_params(req);
+
+    // read_content() normally performs this for regular handlers. ContentReader
+    // routes bypass read_content(), so preserve the same urlencoded behavior.
+    const auto content_type = req.get_header_value("Content-Type");
+    if (server_http_media_type_is(content_type, "application/x-www-form-urlencoded")) {
+        if (body.size() <= CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH) {
+            httplib::Params form_params;
+            httplib::detail::parse_query_text(body, form_params);
+            for (const auto & [key, value] : form_params) {
+                params[key] = value;
+            }
+        }
+    }
+
+    return std::make_unique<server_http_req>(server_http_req{
+        std::move(params),
+        get_headers(req),
+        req.path,
+        build_query_string(req),
+        std::move(body),
+        std::move(files),
+        req.is_connection_closed
+    });
+}
+
+static server_http_req_ptr read_server_http_request_limited(
+        const httplib::Request & req,
+        httplib::Response & res,
+        const httplib::ContentReader & content_reader,
+        size_t max_body_size) {
+    if (req.has_header("Content-Length") &&
+        req.get_header_value_u64("Content-Length") > max_body_size) {
+        res.status = httplib::StatusCode::PayloadTooLarge_413;
+        res.set_content("Payload Too Large", "text/plain");
+        return nullptr;
+    }
+
+    size_t received = 0;
+    bool too_large = false;
+    bool too_many_parts = false;
+
+    auto accept_bytes = [&](size_t n) {
+        if (received > max_body_size || n > max_body_size - received) {
+            too_large = true;
+            return false;
+        }
+        received += n;
+        return true;
+    };
+
+    std::string body;
+    std::map<std::string, uploaded_file> files;
+    bool read_ok = false;
+
+    if (req.is_multipart_form_data()) {
+        std::vector<httplib::FormData> parts;
+        read_ok = content_reader(
+            [&](const httplib::FormData & item) {
+                if (parts.size() >= CPPHTTPLIB_MULTIPART_FORM_DATA_FILE_MAX_COUNT) {
+                    too_many_parts = true;
+                    return false;
+                }
+                parts.push_back(item);
+                return true;
+            },
+            [&](const char * data, size_t n) {
+                if (parts.empty() || !accept_bytes(n)) {
+                    return false;
+                }
+                parts.back().content.append(data, n);
+                return true;
+            });
+
+        if (read_ok) {
+            json form_json = json::object();
+            for (auto & item : parts) {
+                if (item.filename.empty()) {
+                    if (form_json.contains(item.name)) {
+                        if (!form_json[item.name].is_array()) {
+                            json existing_value = form_json[item.name];
+                            form_json[item.name] = json::array({existing_value});
+                        }
+                        form_json[item.name].push_back(item.content);
+                    } else {
+                        form_json[item.name] = item.content;
+                    }
+                } else {
+                    files[item.name] = uploaded_file{
+                        raw_buffer(item.content.begin(), item.content.end()),
+                        item.filename,
+                        item.content_type,
+                    };
+                }
+            }
+            body = form_json.dump();
+        }
+    } else {
+        read_ok = content_reader([&](const char * data, size_t n) {
+            if (!accept_bytes(n)) {
+                return false;
+            }
+            body.append(data, n);
+            return true;
+        });
+    }
+
+    if (!read_ok) {
+        if (too_large || too_many_parts) {
+            res.status = httplib::StatusCode::PayloadTooLarge_413;
+            res.set_content("Payload Too Large", "text/plain");
+        } else if (res.status < 400) {
+            res.status = httplib::StatusCode::BadRequest_400;
+            res.set_content("Failed to read request body", "text/plain");
+        }
+        return nullptr;
+    }
+
+    if (server_http_media_type_is(
+            req.get_header_value("Content-Type"),
+            "application/x-www-form-urlencoded") &&
+        body.size() > CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH) {
+        res.status = httplib::StatusCode::PayloadTooLarge_413;
+        res.set_content("Payload Too Large", "text/plain");
+        return nullptr;
+    }
+
+    return make_server_http_request(req, std::move(body), std::move(files));
+}
+
 static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
     if (response->is_stream()) {
         res.status = response->status;
@@ -557,19 +745,39 @@ static void process_handler_response(server_http_req_ptr && request, server_http
             std::string chunk;
             const bool has_next = response->next(chunk);
             if (!chunk.empty()) {
-                if (!sink.write(chunk.data(), chunk.size())) {
+                // DataSink callbacks are std::function objects. Treat a missing
+                // writer as a transport failure instead of throwing
+                // std::bad_function_call.
+                if (!sink.write || !sink.write(chunk.data(), chunk.size())) {
                     return false;
                 }
                 SRV_DBG("http: streamed chunk: %s\n", chunk.c_str());
             }
+
             if (!has_next) {
+                // Normal application EOF must call done() and still return true
+                // so cpp-httplib marks the content provider successful. There
+                // are paths where DataSink::done is empty; do not call an empty
+                // std::function. For checkpoint transfer specifically, failing
+                // closed here makes on_complete(false) cancel the suspension,
+                // which is safer than committing an unconfirmed checkpoint.
+                if (!sink.done) {
+                    SRV_WRN("%s", "http: stream ended but sink.done is unavailable\n");
+                    return false;
+                }
                 sink.done();
                 SRV_DBG("%s", "http: stream ended\n");
             }
-            return has_next;
+
+            // server_http_res::next() returning false means application-level
+            // EOF after the current chunk, not transport failure. sink.done()
+            // marks the provider complete; return true so cpp-httplib records
+            // the content-provider completion as successful. Actual socket
+            // write failures still return false above.
+            return true;
         };
-        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
-            response->on_complete();
+        const auto on_complete = [request = q_ptr, response = r_ptr](bool success) mutable {
+            response->on_complete(success);
             response.reset();
             request.reset();
         };
@@ -600,67 +808,74 @@ void server_http_context::get(const std::string & path, const server_http_contex
 }
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
+    post(path, handler, CPPHTTPLIB_PAYLOAD_MAX_LENGTH);
+}
+
+void server_http_context::post(
+        const std::string & path,
+        const server_http_context::handler_t & handler,
+        size_t max_body_size) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
-        std::string body = req.body;
-        std::map<std::string, uploaded_file> files;
 
-        if (req.is_multipart_form_data()) {
-            // translate text fields to a JSON object and use it as the body
-            json form_json = json::object();
-            for (const auto & [key, field] : req.form.fields) {
-                if (form_json.contains(key)) {
-                    // if the key already exists, convert it to an array
-                    if (!form_json[key].is_array()) {
-                        json existing_value = form_json[key];
-                        form_json[key] = json::array({existing_value});
-                    }
-                    form_json[key].push_back(field.content);
-                } else {
-                    form_json[key] = field.content;
-                }
-            }
-            body = form_json.dump();
+    // cpp-httplib has one server-wide decompressed payload limit. Raise that
+    // only as far as the largest registered route requires, then enforce each
+    // route's own limit in its ContentReader below. This lets checkpoint resume
+    // exceed the build's normal CPPHTTPLIB_PAYLOAD_MAX_LENGTH without widening
+    // ordinary POST endpoints to the checkpoint limit.
+    pimpl->payload_max_length = std::max(pimpl->payload_max_length, max_body_size);
+    pimpl->srv->set_payload_max_length(pimpl->payload_max_length);
 
-            // populate files from multipart form
-            for (const auto & [key, file] : req.form.files) {
-                files[key] = uploaded_file{
-                    raw_buffer(file.content.begin(), file.content.end()),
-                    file.filename,
-                    file.content_type,
-                };
-            }
+    const std::string route = path_prefix + path;
+
+    pimpl->srv->Post(route, httplib::Server::HandlerWithContentReader(
+        [handler, max_body_size](
+                const httplib::Request & req,
+                httplib::Response & res,
+                const httplib::ContentReader & content_reader) {
+        auto request = read_server_http_request_limited(req, res, content_reader, max_body_size);
+        if (!request) {
+            return;
         }
-
-        server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
-            get_params(req),
-            get_headers(req),
-            req.path,
-            build_query_string(req),
-            body,
-            std::move(files),
-            req.is_connection_closed
-        });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
-    });
+    }));
+
+    // cpp-httplib dispatches ContentReader handlers only when a request has a
+    // body. Keep a normal-handler fallback so zero-length POSTs still work.
+    pimpl->srv->Post(route, httplib::Server::Handler(
+        [handler](const httplib::Request & req, httplib::Response & res) {
+        auto request = make_server_http_request(req, {}, {});
+        server_http_res_ptr response = handler(*request);
+        process_handler_response(std::move(request), response, res);
+    }));
 }
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Delete(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
-        server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
-            get_params(req),
-            get_headers(req),
-            req.path,
-            build_query_string(req),
-            req.body,
-            {},
-            req.is_connection_closed
-        });
+    const std::string route = path_prefix + path;
+
+    // The global httplib limit may have been raised for checkpoint resume, so
+    // DELETE requests with bodies also need the normal route-local limit.
+    pimpl->srv->Delete(route, httplib::Server::HandlerWithContentReader(
+        [handler](
+                const httplib::Request & req,
+                httplib::Response & res,
+                const httplib::ContentReader & content_reader) {
+        auto request = read_server_http_request_limited(
+                req, res, content_reader, CPPHTTPLIB_PAYLOAD_MAX_LENGTH);
+        if (!request) {
+            return;
+        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
-    });
+    }));
+
+    pimpl->srv->Delete(route, httplib::Server::Handler(
+        [handler](const httplib::Request & req, httplib::Response & res) {
+        auto request = make_server_http_request(req, {}, {});
+        server_http_res_ptr response = handler(*request);
+        process_handler_response(std::move(request), response, res);
+    }));
 }
 
 //

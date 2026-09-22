@@ -17,6 +17,7 @@
 #include <ctime>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -3582,6 +3583,16 @@ static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_dat
                     repeat_exp = max_exponent;
                 }
                 float penalty = ctx->dry_multiplier * std::pow(ctx->dry_base, repeat_exp);
+
+                LLAMA_LOG_WARN(
+                    "DRY hit: token=%d repeat_len=%d repeat_exp=%d penalty=%.4f logit=%.4f->%.4f\n",
+                    cur_p->data[i].id,
+                    af_kvp->second,
+                    repeat_exp,
+                    penalty,
+                    cur_p->data[i].logit,
+                    cur_p->data[i].logit - penalty);
+
                 cur_p->data[i].logit -= penalty;
             }
         }
@@ -4320,6 +4331,250 @@ void llama_sampler_copy(const struct llama_sampler * src, struct llama_sampler *
     dst->ctx = tmp->ctx;
     tmp->ctx = nullptr;
     delete tmp;
+}
+
+// utils
+
+//
+// exact-build checkpoint helpers
+//
+
+namespace {
+
+// tagged encoding per chain child:
+//   u16 tag; u32 payload_len; payload...
+// the tag identifies the sampler by interface identity, not by user-visible name
+enum llama_sampler_checkpoint_tag : uint16_t {
+    LLAMA_SAMPLER_CKPT_TAG_NONE   = 0, // immutable/stateless sampler, no payload
+    LLAMA_SAMPLER_CKPT_TAG_DIST   = 1, // dist RNG state
+};
+
+struct llama_sampler_checkpoint_reader {
+    const uint8_t * data;
+    size_t size;
+    size_t pos = 0;
+    bool ok = true;
+
+    bool read_u16(uint16_t & v) {
+        if (pos + 2 > size) { ok = false; return false; }
+        v = (uint16_t) data[pos] | ((uint16_t) data[pos + 1] << 8);
+        pos += 2;
+        return true;
+    }
+
+    bool read_u32(uint32_t & v) {
+        if (pos + 4 > size) { ok = false; return false; }
+        v = (uint32_t) data[pos] | ((uint32_t) data[pos + 1] << 8) | ((uint32_t) data[pos + 2] << 16) | ((uint32_t) data[pos + 3] << 24);
+        pos += 4;
+        return true;
+    }
+
+    bool read_bytes(const uint8_t ** out, size_t & len) {
+        uint32_t n = 0;
+        if (!read_u32(n)) return false;
+        if (pos + n > size) { ok = false; return false; }
+        *out = data + pos;
+        len = n;
+        pos += n;
+        return true;
+    }
+};
+
+struct llama_sampler_checkpoint_writer {
+    std::vector<uint8_t> & out;
+
+    void write_u16(uint16_t v) {
+        out.push_back((uint8_t) (v & 0xff));
+        out.push_back((uint8_t) ((v >> 8) & 0xff));
+    }
+
+    void write_u32(uint32_t v) {
+        out.push_back((uint8_t) (v & 0xff));
+        out.push_back((uint8_t) ((v >> 8) & 0xff));
+        out.push_back((uint8_t) ((v >> 16) & 0xff));
+        out.push_back((uint8_t) ((v >> 24) & 0xff));
+    }
+
+    void write_bytes(const uint8_t * data, size_t len) {
+        write_u32((uint32_t) len);
+        out.insert(out.end(), data, data + len);
+    }
+};
+
+std::string checkpoint_mt19937_to_string(const std::mt19937 & rng) {
+    std::ostringstream ss;
+    ss << rng;
+    if (!ss) {
+        throw std::runtime_error("failed to serialize mt19937");
+    }
+    return ss.str();
+}
+
+bool checkpoint_mt19937_from_string(std::mt19937 & rng, const std::string & s) {
+    std::istringstream ss(s);
+    ss >> rng;
+    return !ss.fail();
+}
+
+// returns the checkpoint tag for a sampler, or -1 if it is not checkpointable
+int llama_sampler_checkpoint_tag(const llama_sampler * smpl) {
+    if (smpl->iface == &llama_sampler_dist_i) {
+        return LLAMA_SAMPLER_CKPT_TAG_DIST;
+    }
+    // immutable/stateless samplers need no payload
+    if (smpl->iface == &llama_sampler_greedy_i ||
+        smpl->iface == &llama_sampler_top_k_i ||
+        smpl->iface == &llama_sampler_top_p_i ||
+        smpl->iface == &llama_sampler_min_p_i ||
+        smpl->iface == &llama_sampler_typical_i ||
+        smpl->iface == &llama_sampler_temp_i ||
+        smpl->iface == &llama_sampler_temp_ext_i ||
+        smpl->iface == &llama_sampler_top_n_sigma_i ||
+        smpl->iface == &llama_sampler_logit_bias_i ||
+        smpl->iface == &llama_sampler_empty_i) {
+        return LLAMA_SAMPLER_CKPT_TAG_NONE;
+    }
+    // accept-side state is rebuilt by common accept replay
+    if (smpl->iface == &llama_sampler_penalties_i ||
+        smpl->iface == &llama_sampler_dry_i ||
+        smpl->iface == &llama_sampler_grammar_i) {
+        return LLAMA_SAMPLER_CKPT_TAG_NONE;
+    }
+    // v1 rejects these
+    return -1;
+}
+
+bool llama_sampler_checkpoint_export_child(
+        const llama_sampler * smpl,
+        llama_sampler_checkpoint_writer & w) {
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * ctx = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & child : ctx->samplers) {
+            if (!llama_sampler_checkpoint_export_child(child.ptr, w)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const int tag = llama_sampler_checkpoint_tag(smpl);
+    if (tag < 0) {
+        return false;
+    }
+
+    w.write_u16((uint16_t) tag);
+
+    if (tag == LLAMA_SAMPLER_CKPT_TAG_DIST) {
+        const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
+        const std::string rng_str = checkpoint_mt19937_to_string(ctx->rng);
+        w.write_bytes((const uint8_t *) rng_str.data(), rng_str.size());
+    } else {
+        w.write_u32(0);
+    }
+
+    return true;
+}
+
+bool llama_sampler_checkpoint_import_child(
+        llama_sampler * smpl,
+        llama_sampler_checkpoint_reader & r) {
+    if (smpl->iface == &llama_sampler_chain_i) {
+        auto * ctx = (llama_sampler_chain *) smpl->ctx;
+        for (auto & child : ctx->samplers) {
+            if (!llama_sampler_checkpoint_import_child(child.ptr, r)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    uint16_t tag = 0;
+    if (!r.read_u16(tag)) {
+        return false;
+    }
+
+    const int expected = llama_sampler_checkpoint_tag(smpl);
+    if (expected < 0 || (uint16_t) expected != tag) {
+        return false;
+    }
+
+    const uint8_t * payload = nullptr;
+    size_t payload_len = 0;
+    if (!r.read_bytes(&payload, payload_len)) {
+        return false;
+    }
+
+    if (tag == LLAMA_SAMPLER_CKPT_TAG_DIST) {
+        auto * ctx = (llama_sampler_dist *) smpl->ctx;
+        const std::string rng_str((const char *) payload, payload_len);
+        if (!checkpoint_mt19937_from_string(ctx->rng, rng_str)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+} // anonymous namespace
+
+bool llama_sampler_checkpoint_supported(
+        const llama_sampler * smpl,
+        std::string & error) {
+    if (!smpl) {
+        error = "null sampler";
+        return false;
+    }
+
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * ctx = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & child : ctx->samplers) {
+            if (!llama_sampler_checkpoint_supported(child.ptr, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (llama_sampler_checkpoint_tag(smpl) < 0) {
+        error = std::string("unsupported sampler: ") + llama_sampler_name(smpl);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_sampler_checkpoint_export_apply_state(
+        const llama_sampler * smpl,
+        std::vector<uint8_t> & out,
+        std::string & error) {
+    if (!llama_sampler_checkpoint_supported(smpl, error)) {
+        return false;
+    }
+
+    out.clear();
+    llama_sampler_checkpoint_writer w { out };
+    if (!llama_sampler_checkpoint_export_child(smpl, w)) {
+        error = "failed to export sampler state";
+        return false;
+    }
+    return true;
+}
+
+bool llama_sampler_checkpoint_import_apply_state(
+        llama_sampler * smpl,
+        const uint8_t * data,
+        size_t size,
+        std::string & error) {
+    if (!llama_sampler_checkpoint_supported(smpl, error)) {
+        return false;
+    }
+
+    llama_sampler_checkpoint_reader r { data, size };
+    if (!llama_sampler_checkpoint_import_child(smpl, r) || !r.ok || r.pos != r.size) {
+        error = "failed to import sampler state";
+        return false;
+    }
+    return true;
 }
 
 // utils

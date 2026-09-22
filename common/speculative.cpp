@@ -174,6 +174,19 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // Generation checkpointing is stricter than prompt/cache checkpointing.
+    // Default to unsupported until an implementation proves that every piece
+    // of cross-round state is covered by the checkpoint state blob.
+    virtual bool checkpoint_supported(std::string & why) const {
+        why = "speculative implementation is not checkpointable: " + common_speculative_type_to_str(type);
+        return false;
+    }
+    virtual bool checkpoint_set_state(
+            llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/, std::string & why) {
+        why = "speculative implementation has no checkpoint restore state: " + common_speculative_type_to_str(type);
+        return false;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1758,6 +1771,98 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    bool checkpoint_supported(std::string & why) const override {
+        // v11 intentionally supports only the independent, single trained MTP
+        // head used by Qwen3.5/Qwen3.5-MoE. Gemma4 shares target memory and
+        // Step3.5 chains multiple heads, so their state/rollback semantics need
+        // a separate audit before they can be checkpointed.
+        if (is_mem_shared) {
+            why = "draft-mtp with target/draft shared memory";
+            return false;
+        }
+        if (chain_heads || n_mtp_layers != 1) {
+            why = "multi-head/chained draft-mtp";
+            return false;
+        }
+        return true;
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        std::string why;
+        if (!checkpoint_supported(why) || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        // Per-sequence state required across MTP rounds:
+        //   pending_h = hidden row paired with the first token of the next
+        //               process()/draft() round.
+        // verify_h/i_batch/i_last are round-local scratch and are deliberately
+        // not persisted at our post-verification quiescent boundary.
+        static constexpr uint8_t magic[8] = { 'M', 'T', 'P', 'C', 'K', 'P', '1', 0 };
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(20 + row_bytes);
+        std::memcpy(data.data(), magic, sizeof(magic));
+
+        auto put_u32 = [&](size_t off, uint32_t v) {
+            data[off + 0] = (uint8_t) (v & 0xff);
+            data[off + 1] = (uint8_t) ((v >> 8) & 0xff);
+            data[off + 2] = (uint8_t) ((v >> 16) & 0xff);
+            data[off + 3] = (uint8_t) ((v >> 24) & 0xff);
+        };
+        put_u32( 8, (uint32_t) n_embd);
+        put_u32(12, (uint32_t) n_mtp_layers);
+        put_u32(16, 0); // flags: single-head, non-shared mode
+        std::memcpy(data.data() + 20, pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    bool checkpoint_set_state(
+            llama_seq_id seq_id, const std::vector<uint8_t> & data, std::string & why) override {
+        if (!checkpoint_supported(why)) {
+            return false;
+        }
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            why = "draft-mtp checkpoint has invalid sequence id";
+            return false;
+        }
+
+        static constexpr uint8_t magic[8] = { 'M', 'T', 'P', 'C', 'K', 'P', '1', 0 };
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() != 20 + row_bytes || std::memcmp(data.data(), magic, sizeof(magic)) != 0) {
+            why = "malformed draft-mtp checkpoint state";
+            return false;
+        }
+
+        auto get_u32 = [&](size_t off) -> uint32_t {
+            return (uint32_t) data[off + 0] |
+                  ((uint32_t) data[off + 1] << 8) |
+                  ((uint32_t) data[off + 2] << 16) |
+                  ((uint32_t) data[off + 3] << 24);
+        };
+        if (get_u32(8) != (uint32_t) n_embd ||
+                get_u32(12) != (uint32_t) n_mtp_layers || get_u32(16) != 0) {
+            why = "draft-mtp checkpoint state does not match the loaded MTP implementation";
+            return false;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + 20, row_bytes);
+
+        // A resumed checkpoint always starts between speculative rounds.
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        i_last[seq_id] = -1;
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        std::string why;
+        if (!checkpoint_set_state(seq_id, data, why)) {
+            SPC_WRN("failed to restore draft-mtp state for seq_id=%d: %s\n", (int) seq_id, why.c_str());
+        }
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2931,6 +3036,31 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+bool common_speculative_checkpoint_supported(const common_speculative * spec, std::string & why) {
+    if (spec == nullptr) {
+        why = "null speculative context";
+        return false;
+    }
+    if (spec->impls.size() != 1) {
+        why = "checkpointing mixed/multiple speculative implementations is not implemented";
+        return false;
+    }
+
+    return spec->impls.front()->checkpoint_supported(why);
+}
+
+bool common_speculative_checkpoint_set_state(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const std::vector<uint8_t> & data,
+        std::string & why) {
+    if (!common_speculative_checkpoint_supported(spec, why)) {
+        return false;
+    }
+
+    return spec->impls.front()->checkpoint_set_state(seq_id, data, why);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

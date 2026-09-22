@@ -2,10 +2,25 @@
 
 #include "llama.h"
 
+#include <string>
 #include <vector>
 
 struct llama_vocab;
 struct llama_grammar;
+
+// INTERNAL exact-build checkpoint helpers. Not part of the public llama.h ABI.
+bool llama_sampler_checkpoint_supported(
+        const llama_sampler * smpl,
+        std::string & error);
+bool llama_sampler_checkpoint_export_apply_state(
+        const llama_sampler * smpl,
+        std::vector<uint8_t> & out,
+        std::string & error);
+bool llama_sampler_checkpoint_import_apply_state(
+        llama_sampler * smpl,
+        const uint8_t * data,
+        size_t size,
+        std::string & error);
 
 // sampler chain
 

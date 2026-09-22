@@ -34,6 +34,45 @@
 
 struct common_sampler;
 
+// exact-build generation checkpoint support
+// local_flags is branch-local by design: every value that changes routing
+// inside the locally modified common_sampler_accept() must be represented
+struct common_sampler_accept_event {
+    llama_token token = LLAMA_TOKEN_NULL;
+    bool is_generated = false;
+    uint32_t local_flags = 0;
+};
+
+enum common_sampler_checkpoint_accept_flag : uint32_t {
+    COMMON_ACCEPT_F_NONE             = 0,
+    COMMON_ACCEPT_F_EXCLUDE_FROM_DRY = 1u << 0,
+};
+
+const std::vector<common_sampler_accept_event> &
+common_sampler_checkpoint_accept_history(const common_sampler * gsmpl);
+
+// rebuild accept-side state by calling the existing local accept function
+// for every saved event, so local DRY/reasoning transition logic runs again
+bool common_sampler_checkpoint_replay_accept_history(
+        common_sampler * gsmpl,
+        const std::vector<common_sampler_accept_event> & events,
+        std::string & error);
+
+// CPU sampling v1: validates the chain and serializes only state that is
+// changed during apply() and cannot be reconstructed from accept history
+bool common_sampler_checkpoint_export_apply_state(
+        const common_sampler * gsmpl,
+        std::vector<uint8_t> & out,
+        std::string & error);
+bool common_sampler_checkpoint_import_apply_state(
+        common_sampler * gsmpl,
+        const uint8_t * data,
+        size_t size,
+        std::string & error);
+bool common_sampler_checkpoint_supported(
+        const common_sampler * gsmpl,
+        std::string & error);
+
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
@@ -44,7 +83,13 @@ struct common_sampler * common_sampler_init(
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
-void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
+// exclude_from_dry skips this token only for the DRY sampler.
+// All other samplers in the chain still receive it.
+void common_sampler_accept(
+        struct common_sampler * gsmpl,
+        llama_token token,
+        bool is_generated,
+        bool exclude_from_dry = false);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);

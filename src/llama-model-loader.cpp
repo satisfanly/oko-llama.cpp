@@ -1615,7 +1615,9 @@ bool llama_model_loader::load_all_data(
         });
     }
 
-    for (struct ggml_tensor * cur : tensors) {
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        struct ggml_tensor * cur = tensors[i];
+
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
