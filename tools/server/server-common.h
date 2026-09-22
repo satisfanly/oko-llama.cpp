@@ -218,6 +218,9 @@ public:
 
     size_t size() const { return tokens.size(); }
 
+    // True only when this token sequence actually contains image/audio chunks.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     bool empty() const { return tokens.empty(); }
 
     void clear() {
@@ -315,6 +318,8 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    int  max_tools_tokens = -1;
+    std::string max_tools_tokens_message;
     std::string media_path;
     bool force_pure_content = false;
 };

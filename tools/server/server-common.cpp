@@ -1337,6 +1337,8 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
 
+    SRV_INF("prompt after template applied:\n%s\n", chat_params.prompt.c_str());
+
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
     if (!chat_params.grammar.empty()) {
@@ -1375,6 +1377,36 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+        }
+    }
+
+    // Tool-call budget: once the per-call token budget is exhausted, force the
+    // template's actual TOOL_EOS marker. The marker may tokenize to multiple
+    // tokens, in which case the whole sequence is forced.
+    {
+        int max_tools_tokens = json_value(body, "max_tools_tokens", opt.max_tools_tokens);
+        const std::string max_tools_tokens_message =
+            json_value(body, "max_tools_tokens_message", opt.max_tools_tokens_message);
+        if (max_tools_tokens < -1) {
+            throw std::invalid_argument("max_tools_tokens must be >= -1");
+        }
+        if (max_tools_tokens >= 0 && has_tools && tool_choice != "none") {
+            if (chat_params.tool_call_start_tag.empty() || chat_params.tool_call_end_tag.empty()) {
+                throw std::invalid_argument(
+                    "--max-tools-tokens requires a chat template with explicit tool-call start/end markers; "
+                    "the active template does not expose a safe TOOL_EOS sequence");
+            }
+            if (!max_tools_tokens_message.empty() && chat_params.thinking_start_tag.empty()) {
+                throw std::invalid_argument(
+                    "--max-tools-tokens-message requires a chat template with an explicit reasoning-start tag");
+            }
+            llama_params["max_tools_tokens"]       = max_tools_tokens;
+            llama_params["tool_budget_start_tag"] = chat_params.tool_call_start_tag;
+            llama_params["tool_budget_end_tag"]   = chat_params.tool_call_end_tag;
+            if (!max_tools_tokens_message.empty()) {
+                llama_params["max_tools_tokens_message"]         = max_tools_tokens_message;
+                llama_params["tool_budget_reasoning_start_tag"] = chat_params.thinking_start_tag;
+            }
         }
     }
 

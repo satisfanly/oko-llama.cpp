@@ -1,8 +1,11 @@
 #include "server-context.h"
 #include "server-chat.h"
+#include "server-checkpoint.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+
+#include <chrono>
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -37,6 +40,82 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// convert the parser/output state to/from the JSON stored in the checkpoint header
+static bool checkpoint_parser_state_from_json(
+        const json & p,
+        server_checkpoint_parser_state & ps,
+        std::string & error) {
+    if (!p.is_object()) {
+        error = "checkpoint parser metadata must be an object";
+        return false;
+    }
+
+    static const char * required[] = {
+        "generated_text",
+        "generated_tool_call_ids",
+        "sent_tool_call_names",
+        "thinking_block_started",
+        "text_block_started",
+        "oai_resp_created",
+        "oai_resp_id",
+        "oai_resp_reasoning_id",
+        "oai_resp_message_id",
+        "oai_resp_fc_id",
+    };
+    for (const char * key : required) {
+        if (!p.contains(key)) {
+            error = std::string("checkpoint parser metadata is missing '") + key + "'";
+            return false;
+        }
+    }
+
+    try {
+        ps.generated_text          = p.at("generated_text").get<std::string>();
+        ps.generated_tool_call_ids = p.at("generated_tool_call_ids").get<std::vector<std::string>>();
+        ps.sent_tool_call_names    = p.at("sent_tool_call_names").get<std::vector<size_t>>();
+        ps.thinking_block_started  = p.at("thinking_block_started").get<bool>();
+        ps.text_block_started      = p.at("text_block_started").get<bool>();
+        ps.oai_resp_created        = p.at("oai_resp_created").get<bool>();
+        ps.oai_resp_id             = p.at("oai_resp_id").get<std::string>();
+        ps.oai_resp_reasoning_id   = p.at("oai_resp_reasoning_id").get<std::string>();
+        ps.oai_resp_message_id     = p.at("oai_resp_message_id").get<std::string>();
+        ps.oai_resp_fc_id          = p.at("oai_resp_fc_id").get<std::string>();
+    } catch (const std::exception & e) {
+        error = std::string("malformed checkpoint parser metadata: ") + e.what();
+        return false;
+    }
+
+    return true;
+}
+
+static json checkpoint_parser_state_to_json(const server_checkpoint_parser_state & ps) {
+    return {
+        {"generated_text",          ps.generated_text},
+        {"generated_tool_call_ids", ps.generated_tool_call_ids},
+        {"sent_tool_call_names",    ps.sent_tool_call_names},
+        {"thinking_block_started",  ps.thinking_block_started},
+        {"text_block_started",      ps.text_block_started},
+        {"oai_resp_created",        ps.oai_resp_created},
+        {"oai_resp_id",             ps.oai_resp_id},
+        {"oai_resp_reasoning_id",   ps.oai_resp_reasoning_id},
+        {"oai_resp_message_id",     ps.oai_resp_message_id},
+        {"oai_resp_fc_id",          ps.oai_resp_fc_id},
+    };
+}
+
+static bool checkpoint_v1_response_type_supported(int value) {
+    switch (value) {
+        case TASK_RESPONSE_TYPE_NONE:
+        case TASK_RESPONSE_TYPE_OAI_CHAT:
+        case TASK_RESPONSE_TYPE_OAI_CMPL:
+        case TASK_RESPONSE_TYPE_OAI_RESP:
+        case TASK_RESPONSE_TYPE_ANTHROPIC:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -362,6 +441,13 @@ struct server_slot {
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
+    // generation checkpoint support
+    bool checkpoint_suspend_requested = false;
+    bool checkpoint_suspended = false;
+    std::shared_ptr<server_checkpoint_exchange> checkpoint_exchange;
+    std::shared_ptr<server_generation_checkpoint> checkpoint_core;
+    std::shared_ptr<server_generation_checkpoint> checkpoint_restore;
+
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
@@ -417,11 +503,38 @@ struct server_slot {
 
         int n_text = 0;
 
-        for (int i = 0; i < (int) prompt.tokens.size(); i++) {
+        const auto & spans = task->params.message_spans.spans;
+        size_t i_span = 0;
+
+        for (size_t i = 0; i < prompt.tokens.size(); i++) {
             const llama_token id = prompt.tokens[i];
 
+            // message_spans are ordered by token position.
+            // Advance past spans which end before the current token.
+            while (i_span < spans.size() &&
+                   i >= spans[i_span].pos + spans[i_span].len) {
+                ++i_span;
+            }
+
+            bool is_system_token = false;
+
+            if (task->params.sampling.dry_exclude_sysp &&
+                i_span < spans.size()) {
+                const auto & span = spans[i_span];
+
+                is_system_token =
+                    span.role == COMMON_CHAT_ROLE_SYSTEM &&
+                    i >= span.pos &&
+                    i < span.pos + span.len;
+            }
+
             if (id != LLAMA_TOKEN_NULL) {
-                common_sampler_accept(smpl.get(), id, false);
+                common_sampler_accept(
+                    smpl.get(),
+                    id,
+                    false,
+                    is_system_token);
+
                 n_text++;
             }
         }
@@ -550,6 +663,22 @@ struct server_slot {
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
+
+            // the slot ended before a checkpoint boundary could be reached
+            if (checkpoint_suspend_requested && checkpoint_exchange) {
+                std::lock_guard<std::mutex> lock(checkpoint_exchange->mutex);
+                checkpoint_exchange->failed = true;
+                checkpoint_exchange->error = "generation ended before checkpoint boundary";
+                checkpoint_exchange->cv.notify_all();
+            }
+
+            // A slot object is reused. Never carry checkpoint/freeze state into
+            // the next request, and release potentially large checkpoint blobs.
+            checkpoint_suspend_requested = false;
+            checkpoint_suspended = false;
+            checkpoint_exchange.reset();
+            checkpoint_core.reset();
+            checkpoint_restore.reset();
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -733,6 +862,23 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+static void dump_slot_state(const char * label, const server_slot & slot) {
+    const size_t kv_size_tgt = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t kv_size_dft = slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    SLT_INF(slot, "[KV DEBUG] %s\n", label);
+    SLT_INF(slot, "[KV DEBUG]   state=%d is_processing=%d\n", (int) slot.state, slot.is_processing());
+    SLT_INF(slot, "[KV DEBUG]   n_ctx=%d prompt_tokens=%zu\n", slot.n_ctx, slot.prompt.tokens.size());
+    SLT_INF(slot, "[KV DEBUG]   kv_cache_target=%.3f MiB kv_cache_draft=%.3f MiB\n",
+            kv_size_tgt / (1024.0 * 1024.0), kv_size_dft / (1024.0 * 1024.0));
+    SLT_INF(slot, "[KV DEBUG]   checkpoint_suspend_requested=%d checkpoint_suspended=%d\n",
+            slot.checkpoint_suspend_requested, slot.checkpoint_suspended);
+    SLT_INF(slot, "[KV DEBUG]   t_last_used=%lld\n", (long long) slot.t_last_used);
+    SLT_INF(slot, "[KV DEBUG]   lora_adapters=%zu\n", slot.lora.size());
+    SLT_INF(slot, "[KV DEBUG]   generated_tokens=%zu generated_text_len=%zu\n",
+            slot.generated_tokens.size(), slot.generated_text.size());
+}
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
@@ -1485,6 +1631,8 @@ private:
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* max_tools_tokens      */ params_base.sampling.tool_budget_tokens,
+                /* max_tools_tokens_msg  */ params_base.sampling.tool_budget_message,
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
@@ -1823,6 +1971,34 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
+        // restore the runtime state of a resumed generation
+        if (slot.task->checkpoint_restore) {
+            std::string checkpoint_error;
+            bool restored = false;
+            try {
+                restored = checkpoint_restore_slot(
+                        slot,
+                        *slot.task->checkpoint_restore,
+                        checkpoint_error);
+            } catch (const std::exception & e) {
+                checkpoint_error = std::string("malformed checkpoint state: ") + e.what();
+            } catch (...) {
+                checkpoint_error = "malformed checkpoint state: unknown exception";
+            }
+
+            if (!restored) {
+                // Restore is not transactional: prompt/KV/sampler state may have
+                // been partially imported. Purge it before this slot becomes reusable.
+                slot.prompt_clear();
+                if (slot.smpl) {
+                    common_sampler_reset(slot.smpl.get());
+                }
+                send_error(slot, checkpoint_error, ERROR_TYPE_INVALID_REQUEST);
+                slot.release();
+                return false;
+            }
+        }
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -2017,6 +2193,915 @@ private:
             }
         }
     }
+
+    //
+    // generation checkpoint support
+    //
+
+    bool checkpoint_v1_slot_supported(const server_slot & slot, std::string & why) const {
+        if (!slot.task) {
+            why = "slot has no task";
+            return false;
+        }
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            why = "only text completion/chat is checkpointable";
+            return false;
+        }
+        if (slot.task->is_parent() || slot.task->is_child()) {
+            why = "parallel completion (n > 1)";
+            return false;
+        }
+        if (slot.can_speculate()) {
+            if (slot.ctx_dft == nullptr || spec == nullptr) {
+                why = "speculative decoding has no draft context";
+                return false;
+            }
+            if (!common_speculative_get_synth_probs(spec.get()).empty()) {
+                why = "synthetic speculative acceptance";
+                return false;
+            }
+            if (!common_speculative_checkpoint_supported(spec.get(), why)) {
+                return false;
+            }
+        }
+        if (slot.mbatch) {
+            why = "multimodal state";
+            return false;
+        }
+        if (slot.task->params.sampling.backend_sampling) {
+            why = "backend sampling";
+            return false;
+        }
+        if (slot.task->params.sampling.n_probs > 0 || slot.task->params.post_sampling_probs) {
+            why = "probability/logprob state not implemented in checkpoint v1";
+            return false;
+        }
+        if (!common_sampler_checkpoint_supported(slot.smpl.get(), why)) {
+            return false;
+        }
+        return true;
+    }
+
+    // Serialize the server-level prompt checkpoint topology. The terminal
+    // llama_state_seq_* state is not sufficient for SWA/hybrid/recurrent
+    // models: future prefix reuse may need to rewind to one of these exact
+    // historical states. id_task is intentionally not persisted because task
+    // ids are local to one llama-server process.
+    bool checkpoint_serialize_prompt_checkpoints(
+            const server_prompt & prompt,
+            std::vector<uint8_t> & out,
+            std::string & error) const {
+        out.clear();
+
+        if (prompt.checkpoints.empty()) {
+            return true;
+        }
+        if (prompt.checkpoints.size() > 1024) {
+            error = "too many prompt checkpoints";
+            return false;
+        }
+
+        constexpr uint32_t format_version = 1;
+        const size_t max_total = server_checkpoint_max_size();
+
+        auto put_raw = [&out, max_total](const void * data, size_t n) -> bool {
+            if (n > max_total || out.size() > max_total - n) {
+                return false;
+            }
+            const auto * p = reinterpret_cast<const uint8_t *>(data);
+            out.insert(out.end(), p, p + n);
+            return true;
+        };
+        auto put_scalar = [&put_raw](const auto & value) -> bool {
+            return put_raw(&value, sizeof(value));
+        };
+        auto put_buf = [&](const std::vector<uint8_t> & buf) -> bool {
+            const uint64_t n = (uint64_t) buf.size();
+            return put_scalar(n) && put_raw(buf.data(), buf.size());
+        };
+
+        const uint32_t count = (uint32_t) prompt.checkpoints.size();
+        if (!put_scalar(format_version) || !put_scalar(count)) {
+            error = "prompt checkpoint topology exceeds serialization limit";
+            return false;
+        }
+
+        for (const auto & cur : prompt.checkpoints) {
+            if (!put_scalar(cur.n_tokens) || !put_scalar(cur.pos_min) || !put_scalar(cur.pos_max) ||
+                    !put_buf(cur.data_tgt) || !put_buf(cur.data_dft) || !put_buf(cur.data_spec)) {
+                out.clear();
+                error = "prompt checkpoint topology exceeds serialization limit";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Rebuild prompt.checkpoints transactionally. Empty data means a legacy
+    // checkpoint produced before prompt-topology persistence was added.
+    bool checkpoint_deserialize_prompt_checkpoints(
+            server_prompt & prompt,
+            const std::vector<uint8_t> & in,
+            std::string & error) const {
+        std::list<common_prompt_checkpoint> restored;
+
+        if (in.empty()) {
+            prompt.checkpoints.clear();
+            return true;
+        }
+
+        constexpr uint32_t expected_version = 1;
+        const size_t max_total = server_checkpoint_max_size();
+        if (in.size() > max_total) {
+            error = "prompt checkpoint topology exceeds serialization limit";
+            return false;
+        }
+        size_t off = 0;
+
+        auto get_scalar = [&in, &off](auto & value) -> bool {
+            if (off > in.size() || sizeof(value) > in.size() - off) {
+                return false;
+            }
+            std::copy_n(in.data() + off, sizeof(value), reinterpret_cast<uint8_t *>(&value));
+            off += sizeof(value);
+            return true;
+        };
+        auto get_buf = [&](std::vector<uint8_t> & buf) -> bool {
+            uint64_t n = 0;
+            if (!get_scalar(n) || n > max_total || off > in.size() || n > in.size() - off) {
+                return false;
+            }
+            buf.assign(in.begin() + off, in.begin() + off + (size_t) n);
+            off += (size_t) n;
+            return true;
+        };
+
+        uint32_t version = 0;
+        uint32_t count = 0;
+        if (!get_scalar(version) || version != expected_version ||
+                !get_scalar(count) || count > 1024) {
+            error = "invalid prompt checkpoint topology section";
+            return false;
+        }
+
+        for (uint32_t i = 0; i < count; ++i) {
+            common_prompt_checkpoint cur;
+            cur.id_task = -1;
+            if (!get_scalar(cur.n_tokens) ||
+                    !get_scalar(cur.pos_min) ||
+                    !get_scalar(cur.pos_max) ||
+                    !get_buf(cur.data_tgt) ||
+                    !get_buf(cur.data_dft) ||
+                    !get_buf(cur.data_spec)) {
+                error = "truncated prompt checkpoint topology section";
+                return false;
+            }
+
+            // A checkpoint cannot describe a token frontier beyond the prompt
+            // whose topology it belongs to. Casting also rejects negative
+            // signed values by turning them into a very large unsigned value.
+            if ((uint64_t) cur.n_tokens > (uint64_t) prompt.n_tokens()) {
+                error = "prompt checkpoint token frontier exceeds restored prompt";
+                return false;
+            }
+
+            restored.push_back(std::move(cur));
+        }
+
+        if (off != in.size()) {
+            error = "trailing bytes in prompt checkpoint topology section";
+            return false;
+        }
+
+        prompt.checkpoints = std::move(restored);
+        return true;
+    }
+
+    // called only at the exact safe boundary: after process_token() has
+    // incorporated the latest sampled/accepted token, before the next update
+    // decodes it. slot.sampled is already accepted and remains pending decode.
+    bool checkpoint_capture_slot_at_safe_boundary(server_slot & slot, std::string & error) {
+        if (!slot.checkpoint_suspend_requested || slot.checkpoint_suspended) {
+            return false;
+        }
+        if (slot.state != SLOT_STATE_GENERATING || slot.i_batch != -1 || !slot.has_next_token) {
+            return false; // wait for the next valid boundary, do not snapshot mid-step
+        }
+
+        // A speculative suspend may be armed while common_speculative_draft()
+        // or common_speculative_process() yielded to the control queue. Never
+        // snapshot those transient states; only the post-verification hook may
+        // observe an empty draft/index set and a committed pending token.
+        if (slot.can_speculate() && (!slot.spec_draft.empty() || !slot.spec_i_batch.empty() || slot.spec_is_replay)) {
+            return false;
+        }
+
+        // The suspend HTTP request may have disappeared before we reached a
+        // safe boundary. In that case leave the original generation untouched.
+        if (slot.checkpoint_exchange) {
+            auto exchange = slot.checkpoint_exchange;
+            std::lock_guard<std::mutex> lock(exchange->mutex);
+            if (exchange->cancelled) {
+                slot.checkpoint_suspend_requested = false;
+                slot.checkpoint_exchange.reset();
+                return false;
+            }
+        }
+
+        auto fail_suspend = [&](const std::string & reason) {
+            auto exchange = slot.checkpoint_exchange;
+            if (exchange) {
+                std::lock_guard<std::mutex> lock(exchange->mutex);
+                exchange->failed = true;
+                exchange->error = reason;
+                exchange->cv.notify_all();
+            }
+            slot.checkpoint_suspend_requested = false;
+            slot.checkpoint_exchange.reset();
+            slot.checkpoint_core.reset();
+            return false;
+        };
+
+        // the request is consumed here, so release() will not report a missing boundary
+        slot.checkpoint_suspend_requested = false;
+        if (!checkpoint_v1_slot_supported(slot, error)) {
+            // signal the suspend endpoint failure but leave the original generation viable
+            return fail_suspend(error);
+        }
+
+        auto cp = std::make_shared<server_generation_checkpoint>();
+        cp->header["kind"] = "generation";
+
+        // A. sequence state: KV/recurrent state of this slot's target sequence
+        const size_t seq_size = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        cp->seq_target.resize(seq_size);
+        if (llama_state_seq_get_data_ext(slot.ctx_tgt, cp->seq_target.data(), seq_size, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != seq_size) {
+            error = "failed to read sequence state";
+            return fail_suspend(error);
+        }
+
+        // For audited speculative decoding, the target state alone is not
+        // enough. Preserve the draft model sequence plus implementation-owned
+        // cross-round state (Qwen3.5 MTP pending_h).
+        if (slot.can_speculate()) {
+            const size_t seq_draft_size = llama_state_seq_get_size_ext(
+                    slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (seq_draft_size == 0) {
+                error = "draft sequence state is empty";
+                return fail_suspend(error);
+            }
+            cp->seq_draft.resize(seq_draft_size);
+            if (llama_state_seq_get_data_ext(
+                        slot.ctx_dft, cp->seq_draft.data(), seq_draft_size,
+                        slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != seq_draft_size) {
+                error = "failed to read draft sequence state";
+                return fail_suspend(error);
+            }
+            if (!common_speculative_get_state(spec.get(), slot.id, cp->speculative_state) ||
+                    cp->speculative_state.empty()) {
+                error = "failed to export speculative checkpoint state";
+                return fail_suspend(error);
+            }
+            const llama_model * draft_model = llama_get_model(slot.ctx_dft);
+            cp->header["speculative"] = {
+                {"type", "draft-mtp"},
+                {"state_version", 1},
+                {"model", {
+                    {"path",        params_base.speculative.draft.mparams.path},
+                    {"n_params",    llama_model_n_params(draft_model)},
+                    {"vocab_size",  (int64_t) llama_vocab_n_tokens(llama_model_get_vocab(draft_model))},
+                    {"n_ctx_train", (int64_t) llama_model_n_ctx_train(draft_model)},
+                    {"n_embd_out",  (int64_t) llama_model_n_embd_out(draft_model)},
+                }},
+            };
+        }
+
+        // B. prompt token container (positions are implicit in the token list)
+        try {
+            const std::vector<char> packed = slot.prompt.tokens.serialize();
+            cp->prompt_state.assign(packed.begin(), packed.end());
+        } catch (const std::exception & e) {
+            error = std::string("failed to serialize prompt tokens: ") + e.what();
+            return fail_suspend(error);
+        }
+
+        // B2. Native server prompt checkpoints.  These are required to retain
+        // prefix-reuse semantics after the resumed generation eventually
+        // becomes idle, especially for SWA/hybrid/recurrent models.
+        if (!checkpoint_serialize_prompt_checkpoints(
+                    slot.prompt, cp->prompt_checkpoints, error)) {
+            std::lock_guard<std::mutex> lock(slot.checkpoint_exchange->mutex);
+            slot.checkpoint_exchange->failed = true;
+            slot.checkpoint_exchange->error = error;
+            slot.checkpoint_exchange->cv.notify_all();
+            return false;
+        }
+
+        // C. sampler state: exact accept history + apply-side state blob
+        {
+            const auto & history = common_sampler_checkpoint_accept_history(slot.smpl.get());
+            for (const auto & ev : history) {
+                cp->accept_history.push_back((uint8_t) (ev.token & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.token >> 8) & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.token >> 16) & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.token >> 24) & 0xff));
+                cp->accept_history.push_back(ev.is_generated ? 1 : 0);
+                cp->accept_history.push_back((uint8_t) (ev.local_flags & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.local_flags >> 8) & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.local_flags >> 16) & 0xff));
+                cp->accept_history.push_back((uint8_t) ((ev.local_flags >> 24) & 0xff));
+            }
+            if (!common_sampler_checkpoint_export_apply_state(slot.smpl.get(), cp->sampler_apply_state, error)) {
+                return fail_suspend(error);
+            }
+        }
+
+        // D. slot scalar state + normalized request + build/model metadata
+        cp->generated_text.assign(slot.generated_text.begin(), slot.generated_text.end());
+
+        json & slot_json = cp->header["slot"];
+        json lora_json = json::array();
+        for (const auto & it : slot.task->params.lora) {
+            lora_json.push_back({{"id", it.first}, {"scale", it.second}});
+        }
+        slot_json = {
+            {"id",                    slot.id},
+            {"n_ctx",                 slot.n_ctx},
+            {"n_keep",                slot.n_keep},
+            {"n_predict_max",         slot.n_predict_max},
+            {"last_nl_pos",           (uint64_t) slot.last_nl_pos},
+            {"n_sent_text",           (uint64_t) slot.n_sent_text},
+            {"has_next_token",        slot.has_next_token},
+            {"has_new_line",          slot.has_new_line},
+            {"truncated",             slot.truncated},
+            {"stop",                  (int) slot.stop},
+            {"stopping_word",         slot.stopping_word},
+            {"sampled",               (int32_t) slot.sampled},
+            {"stats",                 {
+                {"n_prompt_cached",    slot.stats.n_prompt_cached},
+                {"n_prompt_processed", slot.stats.n_prompt_processed},
+                {"n_gen",              slot.stats.n_gen},
+                {"n_draft_tokens",     slot.stats.n_draft_tokens},
+                {"n_draft_accepted",   slot.stats.n_draft_accepted},
+                {"n_draft_verif_steps",slot.stats.n_draft_verif_steps},
+                {"t_start",            slot.stats.t_start},
+                {"t_prompt_last",      slot.stats.t_prompt_last},
+                {"t_gen_last",         slot.stats.t_gen_last},
+            }},
+            {"lora",                  lora_json},
+        };
+
+        json & task_json = cp->header["task"];
+        task_json = {
+            {"id",          slot.task->id},
+            {"type",        (int) slot.task->type},
+            {"res_type",    (int) slot.task->params.res_type},
+            {"cmpl_id",     slot.task->params.oaicompat_cmpl_id},
+            {"model",       slot.task->params.oaicompat_model},
+        };
+
+        cp->header["normalized_request"] = slot.task->checkpoint_request_json;
+
+        cp->header["build_info"] = llama_build_info();
+        cp->header["model"] = {
+            {"name",        model_name},
+            {"path",        params_base.model.path},
+            {"n_params",    llama_model_n_params(model_tgt)},
+            {"vocab_size",  (int64_t) llama_vocab_n_tokens(vocab)},
+            {"n_ctx_train", (int64_t) llama_model_n_ctx_train(model_tgt)},
+            {"n_ctx",       (int64_t) slot.n_ctx},
+        };
+        cp->header["task_type"]      = slot.task->type == SERVER_TASK_TYPE_COMPLETION ? "completion" : "infill";
+        cp->header["response_type"]  = (int) slot.task->params.res_type;
+        cp->header["sampler"] = {
+            {"accept_event_version", 1},
+            {"apply_state_version",  1},
+        };
+
+        // The request can disappear while the (potentially large) state is being
+        // copied. Re-check before publishing the checkpoint or freezing the slot.
+        {
+            auto exchange = slot.checkpoint_exchange;
+            std::lock_guard<std::mutex> lock(exchange->mutex);
+            if (exchange->cancelled) {
+                slot.checkpoint_exchange.reset();
+                return false;
+            }
+            exchange->core = cp;
+        }
+
+        slot.checkpoint_core = cp;
+
+        // freeze until the suspend handler commits the blob or explicitly cancels
+        slot.checkpoint_suspended = true;
+
+        // E. enqueue the barrier on the ORIGINAL task result stream so the
+        // response reader processes every earlier result first, then exports
+        // its parser state into the shared exchange
+        auto barrier = std::make_unique<server_task_result_checkpoint_barrier>();
+        barrier->id             = slot.task->id;
+        barrier->index          = slot.task->index;
+        barrier->id_slot        = slot.id;
+        barrier->exchange       = slot.checkpoint_exchange;
+        barrier->suspended_slot = slot.id;
+        barrier->suspended_task = slot.task->id;
+        queue_results.send(std::move(barrier));
+
+        // do not release the slot yet, the suspend HTTP handler waits until
+        // the response reader consumes the barrier and exports parser state
+        return true;
+    }
+
+    // restore a slot from a checkpoint, called right after launch_slot_with_task()
+    // set up the task and the fresh sampler. must re-establish the safe boundary
+    // invariant: KV through token N-1, sampler has accepted token N, slot.sampled
+    // is token N pending decode, prompt.tokens does not contain it yet
+    bool checkpoint_restore_slot(server_slot & slot, const server_generation_checkpoint & cp, std::string & error) {
+        if (!cp.header.contains("slot") || !cp.header.at("slot").is_object()) {
+            error = "checkpoint is missing slot metadata";
+            return false;
+        }
+
+        const json & slot_json = cp.header.at("slot");
+        const int saved_slot_id = json_value(slot_json, "id", -1);
+        const int saved_n_ctx   = json_value(slot_json, "n_ctx", -1);
+
+        // v1 uses stable slot identity. Do not silently remap sequence state to
+        // another slot, and do not pretend assigning slot.n_ctx resizes ctx_tgt.
+        if (saved_slot_id != slot.id) {
+            error = "checkpoint must resume on its original slot";
+            return false;
+        }
+        if (saved_n_ctx != slot.n_ctx) {
+            error = "checkpoint context size does not match the runtime slot";
+            return false;
+        }
+
+        // v1 checkpoints are captured only at the pending-token safe boundary.
+        // Reject blobs that describe any other slot lifecycle state before
+        // mutating prompt/KV/sampler state.
+        const bool saved_has_next_token = json_value(slot_json, "has_next_token", false);
+        const int  saved_stop           = json_value(slot_json, "stop", -1);
+        const llama_token saved_sampled = (llama_token) json_value(
+                slot_json, "sampled", (int32_t) LLAMA_TOKEN_NULL);
+
+        if (!saved_has_next_token) {
+            error = "checkpoint is not at a pending-token generation boundary";
+            return false;
+        }
+        if (saved_stop != (int) STOP_TYPE_NONE) {
+            error = "checkpoint contains a stopped generation";
+            return false;
+        }
+        if (saved_sampled < 0 || saved_sampled >= llama_vocab_n_tokens(vocab)) {
+            error = "checkpoint contains an invalid pending sampled token";
+            return false;
+        }
+
+        const bool saved_speculative = cp.header.contains("speculative");
+        if (saved_speculative != slot.can_speculate()) {
+            error = "checkpoint speculative configuration does not match the runtime";
+            return false;
+        }
+        if (saved_speculative) {
+            if (!cp.header.at("speculative").is_object()) {
+                error = "malformed speculative checkpoint metadata";
+                return false;
+            }
+            const json & spec_json = cp.header.at("speculative");
+            if (json_value(spec_json, "type", std::string()) != "draft-mtp" ||
+                    json_value(spec_json, "state_version", -1) != 1) {
+                error = "unsupported speculative checkpoint metadata";
+                return false;
+            }
+            if (slot.ctx_dft == nullptr || spec == nullptr ||
+                    cp.seq_draft.empty() || cp.speculative_state.empty()) {
+                error = "speculative checkpoint is missing draft state";
+                return false;
+            }
+            if (!common_speculative_checkpoint_supported(spec.get(), error)) {
+                return false;
+            }
+
+            const llama_model * draft_model = llama_get_model(slot.ctx_dft);
+            const json & draft_json = spec_json.value("model", json::object());
+            if (json_value(draft_json, "path", std::string()) != params_base.speculative.draft.mparams.path ||
+                    json_value(draft_json, "n_params", (uint64_t) 0) != llama_model_n_params(draft_model) ||
+                    json_value(draft_json, "vocab_size", (int64_t) -1) !=
+                        (int64_t) llama_vocab_n_tokens(llama_model_get_vocab(draft_model)) ||
+                    json_value(draft_json, "n_ctx_train", (int64_t) -1) !=
+                        (int64_t) llama_model_n_ctx_train(draft_model) ||
+                    json_value(draft_json, "n_embd_out", (int64_t) -1) !=
+                        (int64_t) llama_model_n_embd_out(draft_model)) {
+                error = "checkpoint does not match the loaded draft/MTP model";
+                return false;
+            }
+        } else if (!cp.seq_draft.empty() || !cp.speculative_state.empty()) {
+            error = "non-speculative checkpoint contains speculative sections";
+            return false;
+        }
+
+        std::map<int, float> saved_lora;
+        try {
+            for (const auto & it : slot_json.value("lora", json::array())) {
+                saved_lora[it.at("id").get<int>()] = it.at("scale").get<float>();
+            }
+        } catch (const std::exception & e) {
+            error = std::string("malformed checkpoint LoRA metadata: ") + e.what();
+            return false;
+        }
+
+        std::map<int, float> request_lora;
+        for (const auto & it : slot.task->params.lora) {
+            request_lora[it.first] = it.second;
+        }
+        if (saved_lora != request_lora) {
+            error = "checkpoint LoRA configuration does not match the resumed request";
+            return false;
+        }
+
+        // prompt tokens, positions are implicit in the token list
+        try {
+            llama_tokens packed(cp.prompt_state.begin(), cp.prompt_state.end());
+            slot.prompt.tokens = server_tokens::deserialize(packed, mctx != nullptr);
+        } catch (const std::exception & e) {
+            error = std::string("failed to restore prompt tokens: ") + e.what();
+            return false;
+        }
+        if (slot.prompt.n_tokens() > slot.n_ctx) {
+            error = "restored prompt does not fit in the slot context";
+            return false;
+        }
+
+        if (!checkpoint_deserialize_prompt_checkpoints(
+                    slot.prompt, cp.prompt_checkpoints, error)) {
+            return false;
+        }
+
+        // KV/recurrent state of the target sequence
+        if (llama_state_seq_set_data_ext(slot.ctx_tgt, cp.seq_target.data(), cp.seq_target.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != cp.seq_target.size()) {
+            error = "failed to restore sequence state";
+            return false;
+        }
+
+        if (saved_speculative) {
+            if (llama_state_seq_set_data_ext(
+                        slot.ctx_dft, cp.seq_draft.data(), cp.seq_draft.size(),
+                        slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != cp.seq_draft.size()) {
+                error = "failed to restore draft sequence state";
+                return false;
+            }
+            if (!common_speculative_checkpoint_set_state(
+                        spec.get(), slot.id, cp.speculative_state, error)) {
+                return false;
+            }
+
+            // None of these objects cross our checkpoint boundary. A fresh
+            // round will rebuild them from slot.sampled, the restored draft KV,
+            // and the restored MTP pending_h.
+            slot.spec_draft.clear();
+            slot.spec_prompt.clear();
+            slot.spec_i_batch.clear();
+            slot.spec_ckpt.clear();
+            slot.spec_is_replay = false;
+            common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+        }
+
+        // sampler: replay the accept history through the local accept path, so
+        // local DRY/reasoning transition logic runs again, then restore the
+        // apply-side state
+        {
+            if (cp.accept_history.size() % 9 != 0) {
+                error = "malformed accept history";
+                return false;
+            }
+            std::vector<common_sampler_accept_event> events;
+            events.reserve(cp.accept_history.size() / 9);
+            for (size_t i = 0; i + 9 <= cp.accept_history.size(); i += 9) {
+                common_sampler_accept_event ev;
+                ev.token = (llama_token) ((uint32_t) cp.accept_history[i] |
+                                          ((uint32_t) cp.accept_history[i + 1] << 8) |
+                                          ((uint32_t) cp.accept_history[i + 2] << 16) |
+                                          ((uint32_t) cp.accept_history[i + 3] << 24));
+
+                const uint8_t generated = cp.accept_history[i + 4];
+                if (generated > 1) {
+                    error = "invalid is_generated value in accept history";
+                    return false;
+                }
+                ev.is_generated = generated != 0;
+
+                ev.local_flags = (uint32_t) cp.accept_history[i + 5] |
+                                 ((uint32_t) cp.accept_history[i + 6] << 8) |
+                                 ((uint32_t) cp.accept_history[i + 7] << 16) |
+                                 ((uint32_t) cp.accept_history[i + 8] << 24);
+
+                if ((ev.local_flags & ~(uint32_t) COMMON_ACCEPT_F_EXCLUDE_FROM_DRY) != 0) {
+                    error = "unknown local flags in accept history";
+                    return false;
+                }
+                if (ev.token < 0 || ev.token >= llama_vocab_n_tokens(vocab)) {
+                    error = "invalid token in accept history";
+                    return false;
+                }
+
+                events.push_back(ev);
+            }
+            if (!common_sampler_checkpoint_replay_accept_history(slot.smpl.get(), events, error)) {
+                return false;
+            }
+            if (!common_sampler_checkpoint_import_apply_state(slot.smpl.get(), cp.sampler_apply_state.data(), cp.sampler_apply_state.size(), error)) {
+                return false;
+            }
+        }
+
+        // slot scalar state. n_ctx was validated above; assigning the scalar
+        // here would not resize the already-created llama context.
+        slot.n_keep         = json_value(slot_json, "n_keep", 0);
+        slot.n_predict_max  = json_value(slot_json, "n_predict_max", -1);
+        slot.last_nl_pos    = json_value(slot_json, "last_nl_pos", (uint64_t) 0);
+        slot.n_sent_text    = json_value(slot_json, "n_sent_text", (uint64_t) 0);
+        slot.has_next_token = saved_has_next_token;
+        slot.has_new_line   = json_value(slot_json, "has_new_line", false);
+        slot.truncated      = json_value(slot_json, "truncated", false);
+        slot.stop           = STOP_TYPE_NONE;
+        slot.stopping_word  = json_value(slot_json, "stopping_word", std::string());
+        slot.sampled        = saved_sampled;
+
+        const json & stats_json = slot_json.value("stats", json::object());
+        slot.stats.n_prompt_cached     = json_value(stats_json, "n_prompt_cached", (uint64_t) 0);
+        slot.stats.n_prompt_processed  = json_value(stats_json, "n_prompt_processed", (uint64_t) 0);
+        slot.stats.n_gen               = json_value(stats_json, "n_gen", (uint64_t) 0);
+        slot.stats.n_draft_tokens      = json_value(stats_json, "n_draft_tokens", (uint64_t) 0);
+        slot.stats.n_draft_accepted    = json_value(stats_json, "n_draft_accepted", (uint64_t) 0);
+        slot.stats.n_draft_verif_steps = json_value(stats_json, "n_draft_verif_steps", (uint64_t) 0);
+        slot.stats.t_start             = json_value(stats_json, "t_start", (int64_t) 0);
+        slot.stats.t_prompt_last       = json_value(stats_json, "t_prompt_last", (int64_t) 0);
+        slot.stats.t_gen_last          = json_value(stats_json, "t_gen_last", (int64_t) 0);
+
+        slot.lora = construct_lora_list(saved_lora);
+
+        slot.generated_text.assign(cp.generated_text.begin(), cp.generated_text.end());
+
+        // the pending token is decoded by the next pre_decode(), do not append it here
+        slot.state = SLOT_STATE_GENERATING;
+        return true;
+    }
+
+
+    // Snapshot only reusable prompt/KV state from an idle slot. This is not a
+    // generation continuation checkpoint: there is no task, sampler or parser
+    // state to preserve. The normal next request will prefix-match the restored
+    // prompt and reuse as much of this sequence as it can.
+    std::shared_ptr<server_generation_checkpoint> checkpoint_capture_idle_slot(
+            const server_slot & slot, std::string & error) const {
+        if (slot.is_processing()) {
+            error = "idle checkpoint requested for a processing slot";
+            return nullptr;
+        }
+        if (slot.prompt.n_tokens() == 0) {
+            error = "idle slot has no reusable prompt cache";
+            return nullptr;
+        }
+        if (slot.prompt.tokens.has_media()) {
+            error = "idle checkpoint does not support multimodal prompt state";
+            return nullptr;
+        }
+
+        auto cp = std::make_shared<server_generation_checkpoint>();
+        cp->header["kind"] = "idle";
+
+        const size_t seq_size = llama_state_seq_get_size_ext(
+                slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (seq_size == 0) {
+            error = "idle target sequence state is empty";
+            return nullptr;
+        }
+        cp->seq_target.resize(seq_size);
+        if (llama_state_seq_get_data_ext(
+                    slot.ctx_tgt, cp->seq_target.data(), seq_size,
+                    slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != seq_size) {
+            error = "failed to read idle target sequence state";
+            return nullptr;
+        }
+
+        // Prompt-cache reuse with speculative decoding needs the draft KV too,
+        // but not the generation-only cross-round state (e.g. MTP pending_h).
+        if (slot.ctx_dft != nullptr) {
+            const size_t seq_draft_size = llama_state_seq_get_size_ext(
+                    slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (seq_draft_size > 0) {
+                cp->seq_draft.resize(seq_draft_size);
+                if (llama_state_seq_get_data_ext(
+                            slot.ctx_dft, cp->seq_draft.data(), seq_draft_size,
+                            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != seq_draft_size) {
+                    error = "failed to read idle draft sequence state";
+                    return nullptr;
+                }
+
+                const llama_model * draft_model = llama_get_model(slot.ctx_dft);
+                cp->header["idle_draft"] = {
+                    {"path",        params_base.speculative.draft.mparams.path},
+                    {"n_params",    llama_model_n_params(draft_model)},
+                    {"vocab_size",  (int64_t) llama_vocab_n_tokens(llama_model_get_vocab(draft_model))},
+                    {"n_ctx_train", (int64_t) llama_model_n_ctx_train(draft_model)},
+                    {"n_embd_out",  (int64_t) llama_model_n_embd_out(draft_model)},
+                };
+            }
+        }
+
+        try {
+            const std::vector<char> packed = slot.prompt.tokens.serialize();
+            cp->prompt_state.assign(packed.begin(), packed.end());
+        } catch (const std::exception & e) {
+            error = std::string("failed to serialize idle prompt tokens: ") + e.what();
+            return nullptr;
+        }
+
+        if (!checkpoint_serialize_prompt_checkpoints(
+                    slot.prompt, cp->prompt_checkpoints, error)) {
+            return nullptr;
+        }
+
+        json lora_json = json::array();
+        for (size_t i = 0; i < slot.lora.size(); ++i) {
+            lora_json.push_back({{"id", (int) i}, {"scale", slot.lora[i].scale}});
+        }
+        cp->header["slot"] = {
+            {"id",    slot.id},
+            {"n_ctx", slot.n_ctx},
+            {"lora",  std::move(lora_json)},
+        };
+        cp->header["build_info"] = std::string(llama_build_info());
+
+        // Use the same model identity fields as the generation checkpoint path.
+        // `meta` belongs to server_routes and is not in scope inside
+        // server_context_impl.
+        cp->header["model"] = {
+            {"name",        model_name},
+            {"path",        params_base.model.path},
+            {"n_params",    llama_model_n_params(model_tgt)},
+            {"vocab_size",  (int64_t) llama_vocab_n_tokens(vocab)},
+            {"n_ctx_train", (int64_t) llama_model_n_ctx_train(model_tgt)},
+            {"n_ctx",       (int64_t) slot.n_ctx},
+        };
+
+        // Keep the five v1 base sections. These generation-only payloads are
+        // deliberately empty for kind=idle.
+        cp->accept_history.clear();
+        cp->sampler_apply_state.clear();
+        cp->generated_text.clear();
+        return cp;
+    }
+
+    // Restore an idle checkpoint into an unused slot after llama-server has
+    // been restarted. Requiring a fresh slot is intentional: it guarantees
+    // there is no stale sampler/speculative implementation state to reconcile.
+    bool checkpoint_restore_idle_slot(
+            server_slot & slot,
+            const server_generation_checkpoint & cp,
+            std::string & error) {
+        if (json_value(cp.header, "kind", std::string("generation")) != "idle") {
+            error = "checkpoint is not an idle checkpoint";
+            return false;
+        }
+        if (slot.is_processing()) {
+            error = "idle checkpoint restore requires an idle slot";
+            return false;
+        }
+        if (slot.t_last_used >= 0 || slot.prompt.n_tokens() != 0) {
+            error = "idle checkpoint restore requires a fresh unused slot";
+            return false;
+        }
+        if (!cp.accept_history.empty() || !cp.sampler_apply_state.empty() || !cp.generated_text.empty()) {
+            error = "idle checkpoint contains generation-only state";
+            return false;
+        }
+        if (!cp.header.contains("slot") || !cp.header.at("slot").is_object()) {
+            error = "idle checkpoint is missing slot metadata";
+            return false;
+        }
+
+        const json & slot_json = cp.header.at("slot");
+        const int saved_slot_id = json_value(slot_json, "id", -1);
+        const int saved_n_ctx   = json_value(slot_json, "n_ctx", -1);
+        if (saved_slot_id != slot.id) {
+            error = "idle checkpoint must restore on its original slot";
+            return false;
+        }
+        if (saved_n_ctx != slot.n_ctx) {
+            error = "idle checkpoint context size does not match the runtime slot";
+            return false;
+        }
+
+        std::map<int, float> saved_lora;
+        try {
+            for (const auto & it : slot_json.value("lora", json::array())) {
+                const int id = it.at("id").get<int>();
+                if (id < 0 || id >= (int) params_base.lora_adapters.size()) {
+                    error = "idle checkpoint contains an invalid LoRA id";
+                    return false;
+                }
+                saved_lora[id] = it.at("scale").get<float>();
+            }
+        } catch (const std::exception & e) {
+            error = std::string("malformed idle checkpoint LoRA metadata: ") + e.what();
+            return false;
+        }
+
+        server_tokens restored_tokens;
+        try {
+            llama_tokens packed(cp.prompt_state.begin(), cp.prompt_state.end());
+            restored_tokens = server_tokens::deserialize(packed, mctx != nullptr);
+        } catch (const std::exception & e) {
+            error = std::string("failed to restore idle prompt tokens: ") + e.what();
+            return false;
+        }
+        if (restored_tokens.size() == 0) {
+            error = "idle checkpoint contains an empty prompt";
+            return false;
+        }
+        if (restored_tokens.size() > (size_t) slot.n_ctx) {
+            error = "restored idle prompt does not fit in the slot context";
+            return false;
+        }
+        if (restored_tokens.has_media()) {
+            error = "idle checkpoint does not support multimodal prompt state";
+            return false;
+        }
+        if (cp.seq_target.empty()) {
+            error = "idle checkpoint target sequence state is empty";
+            return false;
+        }
+
+        const bool has_draft = !cp.seq_draft.empty();
+        if (has_draft) {
+            if (slot.ctx_dft == nullptr || !cp.header.contains("idle_draft") ||
+                    !cp.header.at("idle_draft").is_object()) {
+                error = "idle checkpoint draft state does not match the runtime";
+                return false;
+            }
+            const llama_model * draft_model = llama_get_model(slot.ctx_dft);
+            const json & draft_json = cp.header.at("idle_draft");
+            if (json_value(draft_json, "path", std::string()) != params_base.speculative.draft.mparams.path ||
+                    json_value(draft_json, "n_params", (uint64_t) 0) != llama_model_n_params(draft_model) ||
+                    json_value(draft_json, "vocab_size", (int64_t) -1) !=
+                        (int64_t) llama_vocab_n_tokens(llama_model_get_vocab(draft_model)) ||
+                    json_value(draft_json, "n_ctx_train", (int64_t) -1) !=
+                        (int64_t) llama_model_n_ctx_train(draft_model) ||
+                    json_value(draft_json, "n_embd_out", (int64_t) -1) !=
+                        (int64_t) llama_model_n_embd_out(draft_model)) {
+                error = "idle checkpoint does not match the loaded draft model";
+                return false;
+            }
+        } else if (cp.header.contains("idle_draft")) {
+            error = "idle checkpoint has draft metadata without draft sequence state";
+            return false;
+        }
+        if (!cp.speculative_state.empty()) {
+            error = "idle checkpoint contains generation-only speculative state";
+            return false;
+        }
+
+        // The slot is fresh, but clear its sequence defensively before importing.
+        slot.prompt_clear();
+        slot.prompt.tokens = std::move(restored_tokens);
+
+        if (!checkpoint_deserialize_prompt_checkpoints(
+                    slot.prompt, cp.prompt_checkpoints, error)) {
+            slot.prompt_clear();
+            return false;
+        }
+
+        if (llama_state_seq_set_data_ext(
+                    slot.ctx_tgt, cp.seq_target.data(), cp.seq_target.size(),
+                    slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != cp.seq_target.size()) {
+            slot.prompt_clear();
+            error = "failed to restore idle target sequence state";
+            return false;
+        }
+        if (has_draft && llama_state_seq_set_data_ext(
+                    slot.ctx_dft, cp.seq_draft.data(), cp.seq_draft.size(),
+                    slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != cp.seq_draft.size()) {
+            slot.prompt_clear();
+            error = "failed to restore idle draft sequence state";
+            return false;
+        }
+
+        slot.lora = construct_lora_list(saved_lora);
+        slot.spec_draft.clear();
+        slot.spec_prompt.clear();
+        slot.spec_i_batch.clear();
+        slot.spec_ckpt.clear();
+        slot.spec_is_replay = false;
+        if (spec) {
+            common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+        }
+        slot.state = SLOT_STATE_IDLE;
+        return true;
+    }
+
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
@@ -2667,6 +3752,125 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_SUSPEND:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        std::lock_guard<std::mutex> lock(task.checkpoint_suspend_exchange->mutex);
+                        task.checkpoint_suspend_exchange->failed = true;
+                        task.checkpoint_suspend_exchange->error = "slot does not exist";
+                        task.checkpoint_suspend_exchange->cv.notify_all();
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(task.checkpoint_suspend_exchange->mutex);
+                        if (task.checkpoint_suspend_exchange->cancelled) {
+                            break;
+                        }
+                    }
+
+                    // Between requests there is no generation/parser barrier to
+                    // wait for. Snapshot the retained prompt/KV state directly.
+                    if (!slot->is_processing()) {
+                        std::string checkpoint_error;
+                        auto cp = checkpoint_capture_idle_slot(*slot, checkpoint_error);
+                        if (cp) {
+                            dump_slot_state("checkpoint captured, about to send", *slot);
+                        }
+                        std::lock_guard<std::mutex> lock(task.checkpoint_suspend_exchange->mutex);
+                        if (!cp) {
+                            task.checkpoint_suspend_exchange->failed = true;
+                            task.checkpoint_suspend_exchange->error = checkpoint_error;
+                        } else if (!task.checkpoint_suspend_exchange->cancelled) {
+                            task.checkpoint_suspend_exchange->core = std::move(cp);
+                            task.checkpoint_suspend_exchange->ready = true;
+                        }
+                        task.checkpoint_suspend_exchange->cv.notify_all();
+                        break;
+                    }
+
+                    // Reject unsupported live configurations immediately.
+                    // In particular, speculative decoding skips the ordinary
+                    // single-token sampling branch where the safe-boundary
+                    // checkpoint hook runs. Without this preflight, a suspend
+                    // request against a speculative slot waits forever for a
+                    // boundary callback that can never execute.
+                    std::string checkpoint_why;
+                    if (!checkpoint_v1_slot_supported(*slot, checkpoint_why)) {
+                        std::lock_guard<std::mutex> lock(task.checkpoint_suspend_exchange->mutex);
+                        task.checkpoint_suspend_exchange->failed = true;
+                        task.checkpoint_suspend_exchange->error =
+                                "generation is not checkpointable: " + checkpoint_why;
+                        task.checkpoint_suspend_exchange->cv.notify_all();
+                        break;
+                    }
+
+                    // Only one suspend transaction may own a slot at a time.
+                    if (slot->checkpoint_suspend_requested ||
+                        slot->checkpoint_suspended ||
+                        slot->checkpoint_exchange) {
+                        std::lock_guard<std::mutex> lock(task.checkpoint_suspend_exchange->mutex);
+                        task.checkpoint_suspend_exchange->failed = true;
+                        task.checkpoint_suspend_exchange->error = "checkpoint suspend already in progress for this slot";
+                        task.checkpoint_suspend_exchange->cv.notify_all();
+                        break;
+                    }
+
+                    // The control task only arms suspension. Never capture here:
+                    // queue processing may be entered from yield_to_queue() while
+                    // generation machinery is in a transient state. Ordinary
+                    // decoding captures at its post-process_token boundary and
+                    // speculative decoding at its post-verification boundary.
+                    slot->checkpoint_suspend_requested = true;
+                    slot->checkpoint_exchange = task.checkpoint_suspend_exchange;
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SUSPEND_CANCEL:
+                {
+                    server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                    if (slot == nullptr || slot->checkpoint_exchange != task.checkpoint_suspend_exchange) {
+                        break; // stale cancellation or slot already released/reused
+                    }
+
+                    slot->checkpoint_suspend_requested = false;
+                    slot->checkpoint_suspended = false;
+                    slot->checkpoint_core.reset();
+                    slot->checkpoint_exchange.reset();
+                } break;
+            case SERVER_TASK_TYPE_SLOT_CHECKPOINT_RESTORE:
+                {
+                    auto exchange = task.checkpoint_suspend_exchange;
+                    server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                    std::string checkpoint_error;
+                    bool restored = false;
+
+                    if (slot == nullptr) {
+                        checkpoint_error = "slot does not exist";
+                    } else if (!task.checkpoint_restore) {
+                        checkpoint_error = "idle checkpoint restore has no checkpoint payload";
+                    } else {
+                        try {
+                            restored = checkpoint_restore_idle_slot(
+                                    *slot, *task.checkpoint_restore, checkpoint_error);
+                            if (restored) {
+                                dump_slot_state("checkpoint restored", *slot);
+                            }
+                        } catch (const std::exception & e) {
+                            checkpoint_error = std::string("malformed idle checkpoint state: ") + e.what();
+                        } catch (...) {
+                            checkpoint_error = "malformed idle checkpoint state: unknown exception";
+                        }
+                    }
+
+                    std::lock_guard<std::mutex> lock(exchange->mutex);
+                    if (restored) {
+                        exchange->ready = true;
+                    } else {
+                        exchange->failed = true;
+                        exchange->error = checkpoint_error;
+                    }
+                    exchange->cv.notify_all();
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -2894,7 +4098,7 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (slot.state == SLOT_STATE_GENERATING && !slot.checkpoint_suspended && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -2967,6 +4171,10 @@ private:
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            // a suspended slot is frozen until the original stream releases it
+            if (slot.checkpoint_suspended) {
                 return;
             }
 
@@ -3875,6 +5083,11 @@ private:
                 return;
             }
 
+            // safe checkpoint boundary: the token is accepted and processed,
+            // but not yet decoded into the batch
+            std::string checkpoint_error;
+            checkpoint_capture_slot_at_safe_boundary(slot, checkpoint_error);
+
             slot.print_timings_tg();
         });
 
@@ -4000,6 +5213,12 @@ private:
                     return;
                 }
             }
+
+            // Quiescent speculative checkpoint boundary: accepted tokens and
+            // MTP pending_h are committed, target KV is rolled back to the
+            // logical prompt, and slot.sampled is pending the next decode.
+            std::string checkpoint_error;
+            checkpoint_capture_slot_at_safe_boundary(slot, checkpoint_error);
 
             slot.print_timings_tg();
 
@@ -4228,6 +5447,18 @@ struct server_res_generator : server_res_spipe {
         status = json_value(error_data, "code", 500);
         data = safe_json_to_str({{ "error", error_data }});
     }
+
+    // Optional transport-completion hook. Checkpoint suspend uses this to
+    // commit only after cpp-httplib confirms that the complete blob was sent.
+    std::function<void(bool)> http_complete;
+
+    using server_res_spipe::on_complete;
+    void on_complete(bool success) override {
+        if (http_complete) {
+            http_complete(success);
+        }
+        server_res_spipe::on_complete();
+    }
 };
 
 void server_context::set_state_callback(server_state_callback_t callback) {
@@ -4243,11 +5474,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            std::shared_ptr<server_generation_checkpoint> checkpoint_restore) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
+    if (checkpoint_restore) {
+        // keep the original completion id, so the continuation stream
+        // matches the chunks emitted before the suspension
+        completion_id = json_value(checkpoint_restore->header, "task", json::object()).value("cmpl_id", completion_id);
+    }
     auto & rd = res->rd;
     auto & params = this->params;
 
@@ -4311,6 +5548,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // keep the normalized request so a resumed task can be rebuilt
+            // through the same schema/sampler initialization path
+            task.checkpoint_request_json = data;
+            if (checkpoint_restore) {
+                task.checkpoint_restore = checkpoint_restore;
+                GGML_ASSERT(checkpoint_restore->parser_state_valid);
+                task.checkpoint_parser_state = checkpoint_restore->parser_state;
+                task.checkpoint_has_parser_state = true;
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -4475,6 +5722,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                } else if (auto * barrier = dynamic_cast<server_task_result_checkpoint_barrier*>(result.get())) {
+                    // The parser barrier runs on the original stream. Do not
+                    // terminate that stream until the suspend HTTP handler has
+                    // successfully encoded and committed the checkpoint blob.
+                    bool cancelled = false;
+                    if (barrier->exchange) {
+                        std::unique_lock<std::mutex> lock(barrier->exchange->mutex);
+                        barrier->exchange->cv.wait(lock, [&]() {
+                            return barrier->exchange->committed || barrier->exchange->cancelled;
+                        });
+                        cancelled = barrier->exchange->cancelled;
+                    }
+
+                    if (cancelled) {
+                        output.clear();
+                        return true; // swallow barrier and continue original generation
+                    }
+
+                    // private suspension sentinel, consumed by the proxy; no
+                    // normal finish event is sent for the suspended stream
+                    output = format_oai_sse(barrier->to_json());
+                    return false;
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
@@ -4754,10 +6023,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4771,6 +6036,16 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        // suspend exports an opaque checkpoint, it does not need --slot-save-path
+        if (action == "suspend") {
+            return handle_slots_suspend(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
@@ -4783,6 +6058,13 @@ void server_routes::init_routes() {
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
+    };
+
+    this->post_checkpoint_resume = [this](const server_http_req & req) {
+        return handle_checkpoint_resume(req);
+    };
+    this->post_checkpoint_restore = [this](const server_http_req & req) {
+        return handle_checkpoint_restore(req);
     };
 
     this->get_props = [this](const server_http_req &) {
@@ -5369,6 +6651,383 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_suspend(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    auto exchange = std::make_shared<server_checkpoint_exchange>();
+
+    auto cancel_suspend = [this, exchange, id_slot]() {
+        bool first_cancel = false;
+        {
+            std::lock_guard<std::mutex> lock(exchange->mutex);
+            if (!exchange->cancelled) {
+                exchange->cancelled = true;
+                first_cancel = true;
+            }
+            exchange->cv.notify_all();
+        }
+
+        if (first_cancel) {
+            server_task task(SERVER_TASK_TYPE_SLOT_SUSPEND_CANCEL);
+            task.id = queue_tasks.get_new_id();
+            task.slot_action.id_slot = id_slot;
+            task.checkpoint_suspend_exchange = exchange;
+            // Cancellation/suspend control must not sit behind ordinary
+            // queued work while a low-priority generation keeps running.
+            queue_tasks.post(std::move(task), true);
+        }
+    };
+
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_SUSPEND);
+        task.id = queue_tasks.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.checkpoint_suspend_exchange = exchange;
+        // Preemption is latency-sensitive control traffic.
+        queue_tasks.post(std::move(task), true);
+    }
+
+    // Poll as well as waiting for notifications: an HTTP disconnect changes
+    // req.should_stop(), but does not notify this condition_variable.
+    {
+        std::unique_lock<std::mutex> lock(exchange->mutex);
+        while (!exchange->ready && !exchange->failed && !req.should_stop()) {
+            exchange->cv.wait_for(lock, std::chrono::milliseconds(100));
+        }
+    }
+
+    if (req.should_stop()) {
+        cancel_suspend();
+        return res; // connection is closed; original generation is resumed
+    }
+
+    if (exchange->failed) {
+        res->error(format_error_response(exchange->error, ERROR_TYPE_UNAVAILABLE));
+        return res;
+    }
+
+    auto cp = exchange->core;
+    if (!cp) {
+        cancel_suspend();
+        res->error(format_error_response("checkpoint capture failed", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    const std::string checkpoint_kind = json_value(
+            cp->header, "kind", std::string("generation"));
+    if (checkpoint_kind == "generation") {
+        if (!exchange->parser_ready) {
+            cancel_suspend();
+            res->error(format_error_response("generation checkpoint parser barrier did not complete", ERROR_TYPE_SERVER));
+            return res;
+        }
+        // The parser state is exported by the barrier on the original result stream.
+        cp->header["parser"] = checkpoint_parser_state_to_json(exchange->parser);
+    } else if (checkpoint_kind != "idle") {
+        cancel_suspend();
+        res->error(format_error_response("unknown checkpoint kind", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    std::vector<uint8_t> bytes;
+    std::string error;
+    if (!server_checkpoint_encode(*cp, bytes, error)) {
+        cancel_suspend();
+        res->error(format_error_response(error, ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    const json & task_json = cp->header.value("task", json::object());
+    res->content_type = "application/octet-stream";
+    res->headers["X-Llama-Checkpoint-Version"] = std::to_string(cp->version);
+    res->headers["X-Llama-Checkpoint-Kind"] = checkpoint_kind;
+    res->headers["X-Llama-Checkpoint-Bytes"] = std::to_string(bytes.size());
+    res->headers["X-Llama-Checkpoint-Slot"] = std::to_string(id_slot);
+    if (checkpoint_kind == "generation") {
+        res->headers["X-Llama-Checkpoint-Task"] = std::to_string(json_value(task_json, "id", -1));
+    }
+    const std::string cmpl_id = json_value(task_json, "cmpl_id", std::string());
+    if (!cmpl_id.empty()) {
+        res->headers["X-Llama-Checkpoint-Completion-Id"] = cmpl_id;
+    }
+
+    // A normal server_http_res is copied into httplib::Response before the
+    // socket write, so its no-arg on_complete() cannot prove delivery. Send
+    // the blob through the streaming/content-provider path instead: cpp-httplib
+    // invokes on_complete(bool success) after the provider finishes or fails.
+    if (req.should_stop()) {
+        cancel_suspend();
+        return res;
+    }
+
+    // Avoid constructing another checkpoint-sized std::string and avoid asking
+    // the HTTP stack to write a potentially multi-gigabyte blob as one chunk.
+    // Ownership of the encoded bytes moves into the response provider.
+    auto payload = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+    auto offset  = std::make_shared<size_t>(0);
+
+    // Static storage avoids lambda-capture/odr-use issues through std::min().
+    static constexpr size_t CHECKPOINT_HTTP_CHUNK_BYTES = 1024 * 1024;
+
+    res->next = [payload, offset](std::string & output) mutable -> bool {
+        if (*offset >= payload->size()) {
+            output.clear();
+            return false;
+        }
+
+        const size_t remaining = payload->size() - *offset;
+        const size_t n = std::min(remaining, CHECKPOINT_HTTP_CHUNK_BYTES);
+
+        output.assign(
+                reinterpret_cast<const char *>(payload->data() + *offset),
+                n);
+        *offset += n;
+
+        // false means this is the final application chunk. server-http.cpp
+        // calls sink.done() and still returns true to cpp-httplib, so the
+        // transport completion callback receives success=true.
+        return *offset < payload->size();
+    };
+
+    res->http_complete = [exchange, cancel_suspend](bool success) mutable {
+        if (success) {
+            std::lock_guard<std::mutex> lock(exchange->mutex);
+            if (!exchange->cancelled && !exchange->failed) {
+                exchange->committed = true;
+                exchange->cv.notify_all();
+                return;
+            }
+        }
+
+        // Failed/aborted body delivery means the proxy does not own a complete
+        // checkpoint. Wake the original SSE barrier and unfreeze the slot.
+        cancel_suspend();
+    };
+
+    res->status = 200;
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_checkpoint_resume(const server_http_req & req) {
+    auto res = create_response();
+
+    if (req.body.size() > server_checkpoint_max_size()) {
+        res->error(format_error_response("checkpoint blob exceeds maximum size", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    server_generation_checkpoint cp;
+    std::string error;
+    if (!server_checkpoint_decode((const uint8_t *) req.body.data(), req.body.size(), cp, error)) {
+        res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (json_value(cp.header, "kind", std::string("generation")) != "generation") {
+        res->error(format_error_response(
+                "idle checkpoints must be restored with /v1/checkpoint/restore",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    try {
+    // the checkpoint is not portable across builds
+    if (!cp.header.contains("build_info") || !cp.header.at("build_info").is_string()) {
+        res->error(format_error_response("checkpoint has malformed build metadata", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (cp.header.at("build_info").get<std::string>() != std::string(llama_build_info())) {
+        res->error(format_error_response("checkpoint was created by a different build", ERROR_TYPE_UNAVAILABLE));
+        return res;
+    }
+
+    // model identity, never load a blob into a merely similarly named model
+    if (!cp.header.contains("model") || !cp.header.at("model").is_object()) {
+        res->error(format_error_response("checkpoint has malformed model metadata", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const json & model_json = cp.header.at("model");
+    if (json_value(model_json, "name", std::string()) != meta->model_name ||
+            json_value(model_json, "path", std::string()) != meta->model_path ||
+            json_value(model_json, "n_params", (uint64_t) 0) != meta->model_n_params ||
+            json_value(model_json, "vocab_size", (int64_t) -1) != (int64_t) meta->model_vocab_n_tokens ||
+            json_value(model_json, "n_ctx_train", (int64_t) -1) != (int64_t) meta->model_n_ctx_train) {
+        res->error(format_error_response("checkpoint does not match the loaded model", ERROR_TYPE_UNAVAILABLE));
+        return res;
+    }
+
+    if (!cp.header.contains("sampler") || !cp.header.at("sampler").is_object()) {
+        res->error(format_error_response("checkpoint has malformed sampler metadata", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const json & sampler_json = cp.header.at("sampler");
+    if (json_value(sampler_json, "accept_event_version", -1) != 1 ||
+        json_value(sampler_json, "apply_state_version", -1) != 1) {
+        res->error(format_error_response("unsupported checkpoint sampler state version", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (!cp.header.contains("parser") ||
+        !checkpoint_parser_state_from_json(cp.header.at("parser"), cp.parser_state, error)) {
+        if (error.empty()) {
+            error = "checkpoint is missing parser metadata";
+        }
+        res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    cp.parser_state_valid = true;
+
+    const json normalized_request = json_value(cp.header, "normalized_request", json::object());
+    if (!normalized_request.is_object() || normalized_request.empty()) {
+        res->error(format_error_response("checkpoint is missing the normalized request", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (!cp.header.contains("slot") || !cp.header.at("slot").is_object()) {
+        res->error(format_error_response("checkpoint has malformed slot metadata", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const json & slot_json = cp.header.at("slot");
+    const int saved_slot_id = json_value(slot_json, "id", -1);
+    if (saved_slot_id < 0 || json_value(normalized_request, "id_slot", -1) != saved_slot_id) {
+        res->error(format_error_response("checkpoint normalized request does not preserve the original id_slot", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const int res_type_value = json_value(cp.header, "response_type", -1);
+    if (!checkpoint_v1_response_type_supported(res_type_value)) {
+        res->error(format_error_response(
+                "checkpoint contains an unsupported response_type",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (!cp.header.contains("task") || !cp.header.at("task").is_object()) {
+        res->error(format_error_response("checkpoint has malformed task metadata", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const json & task_json = cp.header.at("task");
+    if (json_value(task_json, "type", -1) != (int) SERVER_TASK_TYPE_COMPLETION ||
+        json_value(task_json, "res_type", -1) != res_type_value) {
+        res->error(format_error_response(
+                "checkpoint task metadata is inconsistent",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const auto res_type = (task_response_type) res_type_value;
+    const std::string task_type = json_value(cp.header, "task_type", std::string("completion"));
+    if (task_type != "completion") {
+        res->error(format_error_response("checkpoint v1 supports completion/chat tasks only", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const server_task_type type = SERVER_TASK_TYPE_COMPLETION;
+
+    return handle_completions_impl(
+            req,
+            type,
+            normalized_request,
+            {},
+            res_type,
+            std::make_shared<server_generation_checkpoint>(std::move(cp)));
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("malformed checkpoint metadata: ") + e.what(),
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_checkpoint_restore(const server_http_req & req) {
+    auto res = create_response();
+
+    if (req.body.size() > server_checkpoint_max_size()) {
+        res->error(format_error_response("checkpoint blob exceeds maximum size", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    server_generation_checkpoint cp;
+    std::string error;
+    if (!server_checkpoint_decode((const uint8_t *) req.body.data(), req.body.size(), cp, error)) {
+        res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (json_value(cp.header, "kind", std::string("generation")) != "idle") {
+        res->error(format_error_response(
+                "generation checkpoints must be restored with /v1/checkpoint/resume",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    try {
+        if (!cp.header.contains("build_info") || !cp.header.at("build_info").is_string()) {
+            res->error(format_error_response("checkpoint has malformed build metadata", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (cp.header.at("build_info").get<std::string>() != std::string(llama_build_info())) {
+            res->error(format_error_response("checkpoint was created by a different build", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        const json & model_json = cp.header.value("model", json::object());
+        if (json_value(model_json, "name", std::string()) != meta->model_name ||
+                json_value(model_json, "path", std::string()) != meta->model_path ||
+                json_value(model_json, "n_params", (uint64_t) 0) != meta->model_n_params ||
+                json_value(model_json, "vocab_size", (int64_t) -1) != (int64_t) meta->model_vocab_n_tokens ||
+                json_value(model_json, "n_ctx_train", (int64_t) -1) != (int64_t) meta->model_n_ctx_train) {
+            res->error(format_error_response("checkpoint does not match the loaded model", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        const json slot_json = cp.header.value("slot", json::object());
+        const int saved_slot_id = json_value(slot_json, "id", -1);
+        if (saved_slot_id < 0) {
+            res->error(format_error_response("idle checkpoint has invalid slot metadata", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto exchange = std::make_shared<server_checkpoint_exchange>();
+        {
+            server_task task(SERVER_TASK_TYPE_SLOT_CHECKPOINT_RESTORE);
+            task.id = queue_tasks.get_new_id();
+            task.slot_action.id_slot = saved_slot_id;
+            task.checkpoint_restore = std::make_shared<server_generation_checkpoint>(std::move(cp));
+            task.checkpoint_suspend_exchange = exchange;
+            queue_tasks.post(std::move(task), true);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(exchange->mutex);
+            while (!exchange->ready && !exchange->failed && !req.should_stop()) {
+                exchange->cv.wait_for(lock, std::chrono::milliseconds(100));
+            }
+        }
+        if (req.should_stop()) {
+            return res;
+        }
+        if (exchange->failed) {
+            res->error(format_error_response(exchange->error, ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        res->content_type = "application/json";
+        res->data = safe_json_to_str({
+            {"status", "ok"},
+            {"kind", "idle"},
+            {"id_slot", saved_slot_id},
+        });
+        res->headers["X-Llama-Checkpoint-Version"] = std::to_string(SERVER_CHECKPOINT_VERSION);
+        res->headers["X-Llama-Checkpoint-Kind"] = "idle";
+        res->headers["X-Llama-Checkpoint-Slot"] = std::to_string(saved_slot_id);
+        res->status = 200;
+        return res;
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("malformed idle checkpoint metadata: ") + e.what(),
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {

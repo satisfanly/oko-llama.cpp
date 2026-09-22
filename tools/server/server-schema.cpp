@@ -154,6 +154,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("How many tokens to scan for repetitions (0 = disabled)"));
 
+    add((new field_bool("dry_generated_only", params.sampling.dry_generated_only))
+        ->set_desc("Use only generated tokens as DRY history; prompt tokens are ignored"));
+
+    add((new field_bool("dry_exclude_sysp", params.sampling.dry_exclude_sysp))
+        ->set_desc("Exclude system prompt/message tokens from DRY history"));
+
+    add((new field_bool("dry_think_only", params.sampling.dry_think_only))
+        ->set_desc("Apply DRY only during the current generated reasoning/thinking block; "
+                   "prompt and final-answer tokens are excluded"));
+
+    add((new field_num("thinking_eos_modifier", params.sampling.thinking_eos_modifier))
+        ->set_hard_limits(1.0f, std::numeric_limits<float>::max())
+        ->set_desc("Divide EOS sampling weight by N while reasoning is active and "
+                   "while sampling the first token immediately after reasoning ends; "
+                   "a detected tool-call grammar trigger disables the modifier even "
+                   "if the reasoning-budget sampler still reports active reasoning "
+                   "(1 = disabled)"));
+
     add((new field_num("mirostat", params.sampling.mirostat))
         ->set_limits(0, 2)
         ->set_desc("Enable Mirostat sampling, controlling perplexity during text generation (0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)"));
@@ -424,6 +442,57 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                     end_tag.insert(end_tag.begin(), message_tokens.begin(), message_tokens.end());
                 }
                 ctx.params.sampling.reasoning_budget_forced = std::move(end_tag);
+            }
+        }));
+
+    add((new field_num("max_tools_tokens", params.sampling.tool_budget_tokens))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Maximum generated tokens inside one tool call (-1 = disabled)"));
+    add((new field_str("tool_budget_start_tag"))
+        ->set_desc("Token string marking the start of a tool call")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.sampling.tool_budget_start = common_tokenize(
+                ctx.vocab, data.at("tool_budget_start_tag").get<std::string>(), false, true);
+        }));
+    add((new field_str("tool_budget_end_tag"))
+        ->set_desc("TOOL_EOS string/sequence forced when the tool-call token budget expires")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            const std::string tag = data.at("tool_budget_end_tag").get<std::string>();
+            ctx.params.sampling.tool_budget_end.clear();
+            ctx.params.sampling.tool_budget_forced.clear();
+            if (!tag.empty()) {
+                auto tokens = common_tokenize(ctx.vocab, tag, false, true);
+                if (!tokens.empty()) {
+                    ctx.params.sampling.tool_budget_end.push_back(tokens);
+
+                    // Forced cutoff continuation:
+                    //   TOOL_EOS + REASONING_START + max_tools_tokens_message
+                    // The natural end matcher remains TOOL_EOS only, so this suffix
+                    // is emitted exclusively when the token budget is exhausted.
+                    const std::string message =
+                        json_value(data, "max_tools_tokens_message", std::string());
+                    ctx.params.sampling.tool_budget_message = message;
+                    if (!message.empty()) {
+                        const std::string reasoning_start =
+                            json_value(data, "tool_budget_reasoning_start_tag", std::string());
+                        if (reasoning_start.empty()) {
+                            throw std::invalid_argument(
+                                "max_tools_tokens_message requires tool_budget_reasoning_start_tag");
+                        }
+
+                        llama_tokens reasoning_start_tokens =
+                            common_tokenize(ctx.vocab, reasoning_start, false, true);
+                        llama_tokens message_tokens =
+                            common_tokenize(ctx.vocab, message, false, true);
+
+                        tokens.insert(tokens.end(),
+                                      reasoning_start_tokens.begin(), reasoning_start_tokens.end());
+                        tokens.insert(tokens.end(), message_tokens.begin(), message_tokens.end());
+                    }
+                    ctx.params.sampling.tool_budget_forced = std::move(tokens);
+                }
             }
         }));
 

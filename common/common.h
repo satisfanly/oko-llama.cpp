@@ -244,6 +244,10 @@ struct common_params_sampling {
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
     int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
+    bool    dry_generated_only = false;  // only generated tokens are added to DRY history
+    bool    dry_exclude_sysp   = false;  // exclude system-message spans from DRY history
+    bool    dry_think_only     = false;  // apply DRY only during generated reasoning/thinking blocks
+
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -292,6 +296,13 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    // tool-call budget sampler parameters
+    int32_t                   tool_budget_tokens = -1;          // -1 = disabled, >= 0 = token budget per tool call
+    std::vector<llama_token>  tool_budget_start;                // tool-call start tag token sequence
+    std::vector<llama_tokens> tool_budget_end;                  // natural tool-call end tag token sequences
+    std::vector<llama_token>  tool_budget_forced;               // forced tool-call end sequence
+    std::string               tool_budget_message;              // message injected after forced TOOL_EOS, inside a new reasoning block
+    float                     thinking_eos_modifier = 1.0f;    // divide EOS weight while thinking + first post-think token; tool calls bypass it
 
     bool backend_sampling = false;
 

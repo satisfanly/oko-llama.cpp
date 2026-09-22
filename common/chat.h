@@ -275,6 +275,8 @@ struct common_chat_params {
     bool                                supports_thinking    = false;
     std::string                         thinking_start_tag;  // e.g., "<think>"
     std::vector<std::string>            thinking_end_tags;   // e.g., "</think>"
+    std::string                         tool_call_start_tag; // e.g., "<|tool_call_begin|>"
+    std::string                         tool_call_end_tag;   // e.g., "<|tool_call_end|>"
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;

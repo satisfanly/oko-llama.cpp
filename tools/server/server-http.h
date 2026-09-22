@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
@@ -31,6 +32,13 @@ struct server_http_res {
 
     // fired before req and res are destroyed
     virtual void on_complete() {}
+
+    // Streaming responses get the transport completion status from
+    // cpp-httplib. Keep the old no-argument hook for existing response types.
+    virtual void on_complete(bool success) {
+        (void) success;
+        on_complete();
+    }
 
     virtual ~server_http_res() = default;
 };
@@ -89,6 +97,7 @@ struct server_http_context {
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
+    void post(const std::string & path, const handler_t & handler, size_t max_body_size) const;
     void del(const std::string & path, const handler_t & handler) const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
