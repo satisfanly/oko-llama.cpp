@@ -3390,9 +3390,108 @@ private:
         return true;
     }
 
+
+    // When slot-prompt similarity is enabled, keep one checkpoint at the
+    // earliest prefix that is expected to be useful for slot reuse.  For
+    // monotonically growing prompts, any future prompt that passes the
+    // similarity test is then guaranteed to match through this checkpoint.
+    int64_t checkpoint_anchor_target(const server_slot & slot) const {
+        if (!slot.task || slot_prompt_similarity <= 0.0f || params_base.n_ctx_checkpoints <= 0) {
+            return -1;
+        }
+
+        const int64_t n_prompt = slot.task->n_tokens();
+        if (n_prompt <= 1) {
+            return -1;
+        }
+
+        // Keep the anchor strictly inside the prompt: a restored checkpoint
+        // must still leave at least one token to evaluate [TAG_PROMPT_LOGITS].
+        const int64_t target = static_cast<int64_t>(n_prompt * slot_prompt_similarity);
+        return std::max<int64_t>(0, std::min<int64_t>(target, n_prompt - 1));
+    }
+
+    int64_t checkpoint_forward_step(const server_slot & slot, int64_t anchor_pos) const {
+        if (!slot.task || params_base.n_ctx_checkpoints <= 1 || anchor_pos < 0) {
+            return -1;
+        }
+
+        const int64_t n_prompt = slot.task->n_tokens();
+        const int64_t n_slots_after_anchor = params_base.n_ctx_checkpoints - 1;
+        const int64_t n_tokens_after_anchor = std::max<int64_t>(0, n_prompt - anchor_pos);
+
+        // Spread the remaining checkpoint budget across the useful part of
+        // the prompt, but never place checkpoints closer than min-step.
+        const int64_t spread_step =
+                (n_tokens_after_anchor + n_slots_after_anchor - 1) / n_slots_after_anchor;
+
+        return std::max<int64_t>(params_base.checkpoint_min_step, spread_step);
+    }
+
+    // Return the next checkpoint position that prompt processing should stop
+    // at.  Before the similarity anchor exists we always target it exactly.
+    // Afterwards, targets are distributed forward from the retained anchor.
+    int64_t next_similarity_checkpoint_target(const server_slot & slot) const {
+        const int64_t anchor_target = checkpoint_anchor_target(slot);
+        if (anchor_target < 0) {
+            return -1;
+        }
+
+        // If prompt processing has not crossed the desired anchor yet, force
+        // a batch boundary there even if an older checkpoint already exists.
+        bool have_exact_anchor = false;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (ckpt.n_tokens == anchor_target) {
+                have_exact_anchor = true;
+                break;
+            }
+        }
+        if (!have_exact_anchor && slot.prompt.n_tokens() <= anchor_target) {
+            return anchor_target;
+        }
+
+        // Find the newest retained checkpoint at/below the desired anchor.
+        int64_t anchor_pos = -1;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (ckpt.n_tokens <= anchor_target) {
+                anchor_pos = ckpt.n_tokens;
+            } else {
+                break;
+            }
+        }
+        if (anchor_pos < 0) {
+            // We already crossed the anchor without a restorable state.  Do
+            // not synthesize one from a later state; a future cold re-prefill
+            // will recreate it.
+            return -1;
+        }
+
+        const int64_t step = checkpoint_forward_step(slot, anchor_pos);
+        if (step <= 0) {
+            return -1;
+        }
+
+        const int64_t last = slot.prompt.checkpoints.empty()
+                ? anchor_pos
+                : slot.prompt.checkpoints.back().n_tokens;
+
+        int64_t target = anchor_pos + step;
+        while (target <= last) {
+            target += step;
+        }
+
+        // Near-prompt-end checkpoints are handled by the existing special
+        // logic below, which intentionally leaves a few tokens to evaluate.
+        return target < slot.task->n_tokens() ? target : -1;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        const bool similarity_anchored = slot_prompt_similarity > 0.0f;
+
+        if (!similarity_anchored) {
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3419,6 +3518,7 @@ private:
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
+        }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
@@ -3438,6 +3538,73 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+        if (similarity_anchored) {
+            const int64_t anchor_target = checkpoint_anchor_target(slot);
+
+            // Keep exactly one checkpoint below/equal to the similarity
+            // boundary: the newest one.  Anything older can never be needed
+            // for a monotonically growing prompt that passes the configured
+            // slot-prompt-similarity threshold.
+            auto anchor = slot.prompt.checkpoints.end();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->n_tokens <= anchor_target) {
+                    anchor = it;
+                } else {
+                    break;
+                }
+            }
+
+            if (anchor != slot.prompt.checkpoints.end() && anchor != slot.prompt.checkpoints.begin()) {
+                for (auto it = slot.prompt.checkpoints.begin(); it != anchor; ) {
+                    SLT_TRC(slot,
+                            "erasing context checkpoint below similarity anchor "
+                            "(anchor_target = %" PRId64 ", n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d)\n",
+                            anchor_target, it->n_tokens, it->pos_min, it->pos_max);
+                    it = slot.prompt.checkpoints.erase(it);
+                }
+            }
+
+            // If special/user-boundary checkpoints caused us to exceed the
+            // budget, preserve the anchor and the newest checkpoint and evict
+            // the most redundant interior checkpoint (smallest adjacent gap).
+            while (slot.prompt.checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
+                if (params_base.n_ctx_checkpoints == 1) {
+                    auto it = slot.prompt.checkpoints.begin();
+                    ++it;
+                    slot.prompt.checkpoints.erase(it, slot.prompt.checkpoints.end());
+                    break;
+                }
+
+                auto first = slot.prompt.checkpoints.begin();
+                auto last  = slot.prompt.checkpoints.end();
+                --last;
+
+                auto victim = first;
+                ++victim;
+                int64_t best_gap = -1;
+
+                for (auto it = victim; it != last; ++it) {
+                    auto prev = it;
+                    --prev;
+                    auto next = it;
+                    ++next;
+
+                    const int64_t gap = std::min<int64_t>(
+                            it->n_tokens - prev->n_tokens,
+                            next->n_tokens - it->n_tokens);
+
+                    if (best_gap < 0 || gap < best_gap) {
+                        best_gap = gap;
+                        victim = it;
+                    }
+                }
+
+                SLT_TRC(slot, "erasing redundant context checkpoint (n_tokens = %" PRId64 ")\n",
+                        victim->n_tokens);
+                slot.prompt.checkpoints.erase(victim);
+            }
+        }
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -4664,6 +4831,8 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    const bool similarity_anchored_checkpoints = do_checkpoint && slot_prompt_similarity > 0.0f;
+
                     bool has_mtmd = false;
 
                     // check if we should process the mtmd chunk
@@ -4712,6 +4881,13 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // A similarity-anchored checkpoint is created at the
+                    // beginning of a batch.  If the previous batch stopped on
+                    // the target, this iteration starts exactly at it.
+                    const int64_t scheduled_checkpoint_target = similarity_anchored_checkpoints
+                            ? next_similarity_checkpoint_target(slot) : -1;
+                    const bool starts_at_scheduled_checkpoint = scheduled_checkpoint_target == slot.prompt.n_tokens();
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4738,8 +4914,20 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
+
+                        // In similarity-anchored mode, force a decode boundary
+                        // at the next scheduled checkpoint.  On the following
+                        // iteration the checkpoint is captured before decoding
+                        // any tokens beyond that boundary.
+                        if (similarity_anchored_checkpoints &&
+                                scheduled_checkpoint_target > 0 &&
+                                !starts_at_scheduled_checkpoint &&
+                                slot.prompt.n_tokens() == scheduled_checkpoint_target) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && !similarity_anchored_checkpoints && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4794,10 +4982,18 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
-                            do_checkpoint = false;
+                        if (similarity_anchored_checkpoints) {
+                            // Mid-prompt checkpoints are driven by the anchor
+                            // schedule rather than message boundaries.
+                            if (!starts_at_scheduled_checkpoint && !near_prompt_end) {
+                                do_checkpoint = false;
+                            }
+                        } else {
+                            // legacy behavior: checkpoint user boundaries and
+                            // the special near-prompt-end positions
+                            if (!is_user_start && !near_prompt_end) {
+                                do_checkpoint = false;
+                            }
                         }
                     }
 
@@ -4813,11 +5009,17 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    if (similarity_anchored_checkpoints) {
+                        do_checkpoint = do_checkpoint && (
+                                starts_at_scheduled_checkpoint || near_prompt_end);
+                    } else {
+                        // no need to create checkpoints that are too close together, unless it's the last user message
+                        do_checkpoint = do_checkpoint && (
+                                slot.prompt.checkpoints.empty() ||
+                                is_last_user_message || near_prompt_end ||
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
